@@ -192,8 +192,8 @@ Resume automatically from interruptions.
 **1. Clone repository**
 
 ```
-git clone https://github.com/yourusername/weak-labels.git
-cd weak-labels
+git clone https://github.com/usamaahmedsh/auto-qrels.git
+cd auto-qrels
 ```
 
 **2. Install llama.cpp**
