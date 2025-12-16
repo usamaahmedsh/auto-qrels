@@ -398,62 +398,6 @@ q000002	0	newton__gravity_p12	3
 
 ---
 
-## Training Models
-
-### Load from HuggingFace
-
-```
-from datasets import load_dataset
-
-# Load your generated dataset
-dataset = load_dataset("yourusername/weak-labels-wiki")
-
-triples = dataset["train"]
-qrels = dataset["qrels"]
-```
-
-### Train Bi-Encoder
-
-```
-from sentence_transformers import SentenceTransformer, losses, InputExample
-from torch.utils.data import DataLoader
-
-# Create training samples
-train_samples = []
-for item in triples:
-    query = item['query']
-    for pos_id in item['positive_doc_ids']:
-        for neg_id in item['hard_negative_doc_ids'][:3]:
-            # Map doc_ids to text from your corpus
-            train_samples.append(
-                InputExample(texts=[query, pos_text, neg_text])
-            )
-
-# Train
-model = SentenceTransformer('BAAI/bge-base-en-v1.5')
-train_dataloader = DataLoader(train_samples, batch_size=32, shuffle=True)
-train_loss = losses.MultipleNegativesRankingLoss(model)
-model.fit(train_objectives=[(train_dataloader, train_loss)], epochs=3)
-```
-
-### Evaluate
-
-```
-import pytrec_eval
-
-# Load qrels
-qrels = {}
-for item in qrels_data:
-    qid, docid, score = item['query_id'], item['doc_id'], item['relevance_score']
-    qrels.setdefault(qid, {})[docid] = score
-
-# Evaluate your model
-evaluator = pytrec_eval.RelevanceEvaluator(qrels, {'ndcg_cut_10', 'map'})
-results = evaluator.evaluate(run)
-```
-
----
-
 ## License
 
 Apache License 2.0
@@ -465,9 +409,9 @@ Apache License 2.0
 ```
 @software{weak_labels_2025,
   title = {Weak Labels: Automated Training Data Generation for Information Retrieval},
-  author = {Your Name},
+  author = {Usama Ahmed},
   year = {2025},
-  url = {https://github.com/yourusername/weak-labels}
+  url = {https://github.com/usamaahmedsh/auto-qrels}
 }
 ```
 
