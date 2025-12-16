@@ -1,0 +1,26 @@
+# Core ML/NLP
+datasets>=2.14.0
+sentence-transformers>=2.2.2
+torch>=2.0.0
+transformers>=4.30.0
+numpy>=1.24.0
+
+# BM25 Retrieval - Pure Python, no Java
+bm25s[full]>=0.2.0
+PyStemmer>=2.2.0
+
+# Dense Retrieval
+faiss-cpu>=1.8.0
+
+# Utilities
+python-dotenv>=1.0.0
+pyyaml>=6.0
+tqdm>=4.66.0
+loguru>=0.7.0
+httpx>=0.24.0
+
+# Optional: Better async performance
+httpx[http2]>=0.24.0
+
+# HuggingFace Hub
+huggingface-hub>=0.20.0

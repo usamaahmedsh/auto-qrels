@@ -1,0 +1,100 @@
+# Dataset Configuration
+dataset:
+  name: "wiki"  # Active dataset: "wiki" or "msmarco"
+  
+  corpus:
+    name: "usamaahmedsh/wiki-synthetic-prepared-corpus"
+    split: "train"
+    text_field: "text"
+    id_field: "doc_id"
+  
+  queries:
+    name: "usamaahmedsh/wiki-synthetic-prepared-queries"
+    split: "train"
+    text_field: "text"
+    id_field: "query_id"
+
+
+# Paths Configuration
+paths:
+  prepared_dir: "data/prepared"
+  hf_cache_dir: "data/hf_cache"
+  passages_dir: "data/passages"
+  indexes_dir: "data/indexes"
+
+
+# Corpus Chunking
+corpus:
+  passage_tokens: 160
+  passage_stride: 80
+
+
+# BM25 Index
+bm25:
+  k1: 0.9
+  b: 0.4
+
+
+# Dense Encoder
+dense:
+  model_name: "BAAI/bge-base-en-v1.5"
+  device: "mps"  # "cuda", "cpu", or "mps"
+  batch_size: 32
+
+
+# LLM Judge
+llm:
+  base_url: "http://127.0.0.1:8080/v1/chat/completions"
+  model: "llama-3.2-3b-instruct"
+  timeout: 30.0  # Reduced (3B is faster)
+  max_concurrent: 20  # Increased (3B handles more)
+
+
+
+# Agent Configuration
+agent:
+  # BM25 retrieval
+  global_top_k_bm25: 200
+  bm25_score_percentile: 0.5
+  
+  # Dense retrieval
+  dense_top_k_from_bm25: 100
+  
+  # LLM judging
+  llm_candidates_top_k: 40
+  llm_conf_threshold: 0.75
+  positives_max: 5
+  
+  # Hard negatives
+  hard_negatives_per_query: 10
+  
+  # Filtering
+  min_passage_tokens: 50
+  max_passages_per_page: 2
+  
+  # Checkpointing
+  checkpoint_dir: "data/checkpoints"
+  checkpoint_interval: 100
+
+  # Testing
+  max_queries: null
+
+
+# Output
+output:
+  qrels_path: "data/output/qrels.tsv"
+  triples_path: "data/output/triples.jsonl"
+
+
+# Logging
+logging:
+  log_dir: "logs"
+  level: "INFO"
+  log_file: "agent.log"
+
+# HuggingFace Hub (optional)
+huggingface:
+  auto_push: false  # Set to true to auto-push after agent completes
+  repo_id: "usamaahmedsh/weak-labels-wiki"  # Your HF repo
+  token: null  # Or set HF_TOKEN env var
+  private: false  # Make dataset private
