@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Push weak labels outputs to HuggingFace Hub."""
 
+
 import os
 import json
 from pathlib import Path
@@ -9,6 +10,7 @@ from datasets import Dataset
 from loguru import logger
 import argparse
 from dotenv import load_dotenv
+
 
 
 def load_qrels(qrels_path: Path):
@@ -29,6 +31,7 @@ def load_qrels(qrels_path: Path):
     return data
 
 
+
 def load_triples(triples_path: Path):
     """Load triples.jsonl into dataset format."""
     data = []
@@ -41,6 +44,7 @@ def load_triples(triples_path: Path):
     return data
 
 
+
 def push_to_hub(
     qrels_path: str,
     triples_path: str,
@@ -49,12 +53,12 @@ def push_to_hub(
     private: bool = False
 ):
     """
-    Push qrels and triples to HuggingFace Hub.
+    Push qrels and triples to HuggingFace Hub as separate datasets.
     
     Args:
         qrels_path: Path to qrels.tsv
         triples_path: Path to triples.jsonl
-        repo_id: HuggingFace repo (e.g., "username/dataset-name")
+        repo_id: HuggingFace repo base (e.g., "username/dataset-name")
         token: HF API token (or set HF_TOKEN env var)
         private: Make repo private
     """
@@ -89,19 +93,20 @@ def push_to_hub(
     # Initialize API
     api = HfApi(token=token)
     
-    # Create repo (if doesn't exist)
+    # Create qrels repo
+    qrels_repo_id = f"{repo_id}-qrels"
     try:
-        logger.info(f"Creating repository: {repo_id}")
+        logger.info(f"Creating qrels repository: {qrels_repo_id}")
         create_repo(
-            repo_id=repo_id,
+            repo_id=qrels_repo_id,
             repo_type="dataset",
             private=private,
             exist_ok=True,
             token=token
         )
-        logger.info("✓ Repository ready")
+        logger.info("✓ Qrels repository ready")
     except Exception as e:
-        logger.warning(f"Repo creation note: {e}")
+        logger.warning(f"Qrels repo creation note: {e}")
     
     # Load and push qrels as dataset
     logger.info("Converting qrels to HuggingFace dataset...")
@@ -110,12 +115,36 @@ def push_to_hub(
     
     logger.info("Pushing qrels dataset...")
     qrels_dataset.push_to_hub(
-        repo_id,
-        split="qrels",
+        qrels_repo_id,
+        split="train",
         token=token,
         private=private
     )
+    
+    # Upload raw qrels file
+    api.upload_file(
+        path_or_fileobj=str(qrels_path),
+        path_in_repo="qrels.tsv",
+        repo_id=qrels_repo_id,
+        repo_type="dataset",
+        token=token
+    )
     logger.info("✓ Qrels pushed")
+    
+    # Create triples repo
+    triples_repo_id = f"{repo_id}-triples"
+    try:
+        logger.info(f"Creating triples repository: {triples_repo_id}")
+        create_repo(
+            repo_id=triples_repo_id,
+            repo_type="dataset",
+            private=private,
+            exist_ok=True,
+            token=token
+        )
+        logger.info("✓ Triples repository ready")
+    except Exception as e:
+        logger.warning(f"Triples repo creation note: {e}")
     
     # Load and push triples as dataset
     logger.info("Converting triples to HuggingFace dataset...")
@@ -124,176 +153,32 @@ def push_to_hub(
     
     logger.info("Pushing triples dataset...")
     triples_dataset.push_to_hub(
-        repo_id,
+        triples_repo_id,
         split="train",
         token=token,
         private=private
     )
-    logger.info("✓ Triples pushed")
     
-    # Upload raw files as well (for convenience)
-    logger.info("Uploading raw files...")
-    
-    api.upload_file(
-        path_or_fileobj=str(qrels_path),
-        path_in_repo="qrels.tsv",
-        repo_id=repo_id,
-        repo_type="dataset",
-        token=token
-    )
-    
+    # Upload raw triples file
     api.upload_file(
         path_or_fileobj=str(triples_path),
         path_in_repo="triples.jsonl",
-        repo_id=repo_id,
+        repo_id=triples_repo_id,
         repo_type="dataset",
         token=token
     )
-    
-    logger.info("✓ Raw files uploaded")
-    
-    # Create README
-    readme_content = f"""---
-license: apache-2.0
-task_categories:
-- text-retrieval
-- information-retrieval
-language:
-- en
-tags:
-- weak-supervision
-- training-data
-- relevance-judgments
-size_categories:
-- {get_size_category(triples_count)}
----
-
-# Weak Labels Training Data
-
-Automatically generated training data for information retrieval using weak supervision.
-
-## Dataset Description
-
-This dataset contains relevance judgments and training triples for training dense retrievers.
-
-### Statistics
-
-- **Qrels entries**: {qrels_count:,}
-- **Training triples**: {triples_count:,}
-- **Relevance scale**: 0-3 (0=not relevant, 3=perfectly relevant)
-
-### Splits
-
-- `qrels`: Relevance judgments (query_id, doc_id, relevance_score)
-- `train`: Training triples (query, positive_doc_ids, hard_negative_doc_ids)
-
-## Usage
-
-### Load Qrels
-
-from datasets import load_dataset
-
-qrels = load_dataset("{repo_id}", split="qrels")
-
-text
-
-### Load Training Triples
-
-from datasets import load_dataset
-
-triples = load_dataset("{repo_id}", split="train")
-
-text
-
-### Train Dense Retriever
-
-from sentence_transformers import SentenceTransformer, losses, InputExample
-from torch.utils.data import DataLoader
-
-Load triples
-dataset = load_dataset("{repo_id}", split="train")
-
-Create training samples
-train_samples = []
-for item in dataset:
-query = item['query']
-for pos_id, neg_id in zip(item['positive_doc_ids'], item['hard_negative_doc_ids']):
-# You'll need to map doc_ids to actual text
-train_samples.append(InputExample(texts=[query, pos_text, neg_text]))
-
-Train
-model = SentenceTransformer('BAAI/bge-base-en-v1.5')
-train_dataloader = DataLoader(train_samples, batch_size=32)
-train_loss = losses.MultipleNegativesRankingLoss(model)
-model.fit(train_objectives=[(train_dataloader, train_loss)], epochs=3)
-
-text
-
-## Citation
-
-If you use this dataset, please cite:
-
-@misc{{weak-labels-{repo_id.split('/')[-1]},
-author = {{{repo_id.split('/')}}},
-title = {{Weak Labels Training Data}},
-year = {{2025}},
-publisher = {{HuggingFace}},
-howpublished = {{\url{{https://huggingface.co/datasets/{repo_id}}}}}
-}}
-
-text
-
-## Dataset Creation
-
-Generated using weak supervision with:
-- BM25 retrieval
-- Dense encoder reranking
-- Cross-encoder filtering
-- LLM relevance judging (binary YES/NO)
-
-## License
-
-Apache 2.0
-"""
-    
-    readme_path = Path("README.md")
-    with open(readme_path, 'w') as f:
-        f.write(readme_content)
-    
-    api.upload_file(
-        path_or_fileobj=str(readme_path),
-        path_in_repo="README.md",
-        repo_id=repo_id,
-        repo_type="dataset",
-        token=token
-    )
-    
-    readme_path.unlink()  # Clean up
-    
-    logger.info("✓ README created")
+    logger.info("✓ Triples pushed")
     
     # Print success message
     logger.info("\n" + "="*60)
     logger.info("✓ Successfully pushed to HuggingFace Hub!")
     logger.info("="*60)
-    logger.info(f"\nDataset URL: https://huggingface.co/datasets/{repo_id}")
+    logger.info(f"\nQrels dataset: https://huggingface.co/datasets/{qrels_repo_id}")
+    logger.info(f"Triples dataset: https://huggingface.co/datasets/{triples_repo_id}")
     logger.info("\nLoad with:")
-    logger.info(f'  from datasets import load_dataset')
-    logger.info(f'  dataset = load_dataset("{repo_id}")')
+    logger.info(f'  qrels = load_dataset("{qrels_repo_id}")')
+    logger.info(f'  triples = load_dataset("{triples_repo_id}")')
 
-
-def get_size_category(count: int) -> str:
-    """Get HuggingFace size category."""
-    if count < 1000:
-        return "n<1K"
-    elif count < 10000:
-        return "1K<n<10K"
-    elif count < 100000:
-        return "10K<n<100K"
-    elif count < 1000000:
-        return "100K<n<1M"
-    else:
-        return "1M<n<10M"
 
 
 def main():
@@ -342,6 +227,7 @@ def main():
         token=args.token,
         private=args.private
     )
+
 
 
 if __name__ == "__main__":

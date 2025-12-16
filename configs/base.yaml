@@ -94,7 +94,7 @@ logging:
 
 # HuggingFace Hub (optional)
 huggingface:
-  auto_push: false  # Set to true to auto-push after agent completes
+  auto_push: true  # Set to true to auto-push after agent completes
   repo_id: "usamaahmedsh/weak-labels-wiki"  # Your HF repo
   token: null  # Or set HF_TOKEN env var
   private: false  # Make dataset private
