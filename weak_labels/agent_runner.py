@@ -1,372 +1,440 @@
-"""Agent with cross-encoder, smart sampling, and monitoring."""
+"""
+weak_labels/agent_runner.py
 
-from typing import Dict, Any, List, Tuple
-import json
-import random
-import time
+Config-driven agent runner (NO hidden knobs).
+
+Design goals:
+- All tunables come from config dict (later configs/base.yaml).
+- CPU-only agent is supported (recommended when vLLM owns the GPU).
+- Uses BM25 -> dense rerank -> LLM judge -> write qrels/triples.
+- Checkpoint/resume.
+- Optional parallelism across queries (ThreadPoolExecutor), controlled by config.
+
+Expected config keys (aliases you will put in base.yaml later):
+
+agent:
+  # batching / parallelism
+  batch_size: int
+  concurrent_queries: int
+  checkpoint_dir: str
+  checkpoint_interval: int
+  max_queries: null|int
+
+  # retrieval
+  global_top_k_bm25: int
+  dense_top_k_from_bm25: int
+
+  # LLM candidate selection / labeling
+  llm_candidates_top_k: int
+  llm_conf_threshold: float
+  positives_max: int
+  hard_negatives_per_query: int
+
+  # filtering
+  min_passage_tokens: int
+  max_passages_per_page: int
+
+output:
+  qrels_path: str
+  triples_path: str
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Any, List, Tuple, Optional
 from pathlib import Path
-import statistics
-from tqdm import tqdm
+import json
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
-from sentence_transformers import CrossEncoder
 
-from .dense_encoder import DenseEncoder
 from .bm25_index import BM25Index
+from .dense_encoder import DenseEncoder
 from .llm_client import CachedLLMJudge
 
 
+DEFAULT_AGENT_CFG: Dict[str, Any] = {
+    "batch_size": 512,
+    "concurrent_queries": 4,
+    "checkpoint_dir": "data/checkpoints",
+    "checkpoint_interval": 100,
+    "max_queries": None,
+    "global_top_k_bm25": 200,
+    "dense_top_k_from_bm25": 100,
+    "llm_candidates_top_k": 30,
+    "llm_conf_threshold": 0.90,
+    "positives_max": 7,
+    "hard_negatives_per_query": 20,
+    "min_passage_tokens": 50,
+    "max_passages_per_page": 2,
+}
+
+
+def _deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_update(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _count_tokens_rough(s: str) -> int:
+    # Cheap approximation; real tokenizers are slower and not needed for filtering.
+    return len((s or "").split())
+
+
+def _page_id_from_doc_id(doc_id: str) -> str:
+    # Matches your earlier convention "pageId_Pxx" if present.
+    s = doc_id or ""
+    if "_P" in s:
+        return s.rsplit("_P", 1)[0]
+    return s
+
+
 class Agent:
-    """
-    Optimized agent with cross-encoder filtering and smart sampling.
-    """
-    
     def __init__(
         self,
         bm25: BM25Index,
         dense_encoder: DenseEncoder,
         llm_judge: CachedLLMJudge,
-        config: Dict[str, Any]
+        config: Dict[str, Any],
     ):
         self.bm25 = bm25
         self.dense_encoder = dense_encoder
         self.llm_judge = llm_judge
-        self.cfg = config
-        
-        # Load cross-encoder for better filtering
-        logger.info("Loading cross-encoder...")
-        self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-        logger.info("✓ Cross-encoder loaded")
-        
-        # Setup output paths
-        self.qrels_path = Path(config['output']['qrels_path'])
-        self.triples_path = Path(config['output']['triples_path'])
-        self.checkpoint_dir = Path(config['agent']['checkpoint_dir'])
-        
+
+        self.cfg_raw = config
+        self.agent_cfg = _deep_update(DEFAULT_AGENT_CFG, (config.get("agent") or {}))
+
+        self.qrels_path = Path(config["output"]["qrels_path"])
+        self.triples_path = Path(config["output"]["triples_path"])
+        self.checkpoint_dir = Path(self.agent_cfg["checkpoint_dir"])
+        self.checkpoint_file = self.checkpoint_dir / "progress.json"
+
         for p in [self.qrels_path, self.triples_path]:
             p.parent.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize stats tracking
-        self.stats = {
+
+        # Locks
+        self._stats_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._processed_lock = threading.Lock()
+
+        # Stats
+        self.stats: Dict[str, Any] = {
             "queries_processed": 0,
             "passages_judged": 0,
             "positives_found": 0,
             "hard_negatives_found": 0,
-            "llm_calls": 0,
-            "cache_hits": 0,
-            "total_time": 0.0,
-            "avg_time_per_query": 0.0
+            "total_time_s": 0.0,
+            "avg_time_per_query_s": 0.0,
         }
-        
-        # Load checkpoint
-        self.checkpoint_file = self.checkpoint_dir / "progress.json"
+
         self.processed_queries = self._load_checkpoint()
-        
-        logger.info(f"✓ Agent initialized (checkpoint: {len(self.processed_queries)} queries)")
-    
-    def _load_checkpoint(self) -> set:
-        """Load set of already processed query IDs."""
+        logger.info(f"✓ Agent initialized (checkpoint: {len(self.processed_queries):,} queries)")
+
+        # Build a fast doc_id -> text mapping if BM25 exposes doc_ids/corpus.
+        self._doc_text: Optional[Dict[str, str]] = None
+        if hasattr(self.bm25, "doc_ids") and hasattr(self.bm25, "corpus"):
+            try:
+                doc_ids = list(self.bm25.doc_ids)
+                corpus = list(self.bm25.corpus)
+                if len(doc_ids) == len(corpus):
+                    self._doc_text = dict(zip(doc_ids, corpus))
+                    logger.info(f"✓ Built in-memory doc lookup: {len(self._doc_text):,} passages")
+            except Exception:
+                self._doc_text = None
+
+    # -----------------------------
+    # Checkpointing
+    # -----------------------------
+    def _load_checkpoint(self) -> set[str]:
         if self.checkpoint_file.exists():
-            with open(self.checkpoint_file, 'r') as f:
-                data = json.load(f)
-                return set(data.get("processed_query_ids", []))
+            try:
+                with open(self.checkpoint_file, "r") as f:
+                    data = json.load(f)
+                ids = set(data.get("processed_query_ids", []))
+                prev_stats = data.get("stats")
+                if isinstance(prev_stats, dict):
+                    self.stats.update(prev_stats)
+                return ids
+            except Exception as e:
+                logger.warning(f"Failed to load checkpoint: {e}")
         return set()
-    
-    def _save_checkpoint(self):
-        """Save checkpoint."""
-        with open(self.checkpoint_file, 'w') as f:
-            json.dump({
+
+    def _save_checkpoint(self) -> None:
+        with self._processed_lock, self._stats_lock:
+            payload = {
                 "processed_query_ids": list(self.processed_queries),
-                "stats": self.stats
-            }, f, indent=2)
-    
-    def _estimate_remaining(self, total_queries: int) -> str:
-        """Estimate time remaining."""
-        if self.stats["avg_time_per_query"] == 0:
-            return "calculating..."
-        
-        remaining = total_queries - self.stats["queries_processed"]
-        seconds = remaining * self.stats["avg_time_per_query"]
-        
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        
-        return f"{hours}h {minutes}m"
-    
-    def _log_stats(self, total_queries: int):
-        """Log progress stats."""
-        logger.info(f"""
-╔════════════════════════════════════════╗
-║          PROGRESS STATS                ║
-╠════════════════════════════════════════╣
-║ Queries:      {self.stats['queries_processed']:>10,} ║
-║ Positives:    {self.stats['positives_found']:>10,} ║
-║ Hard Negs:    {self.stats['hard_negatives_found']:>10,} ║
-║ LLM calls:    {self.stats['llm_calls']:>10,} ║
-║ Avg/query:    {self.stats['avg_time_per_query']:>9.1f}s ║
-║ Est. remain:  {self._estimate_remaining(total_queries):>10} ║
-╚════════════════════════════════════════╝
-        """)
-    
-    def smart_sample_passages(
-        self, 
-        bm25_results: List[Tuple[str, float]], 
-        dense_results: List[Dict],
-        num_llm_candidates: int = 25
-    ) -> List[Dict]:
-        """
-        Smart sampling: Judge top candidates + random sample from middle/bottom.
-        Reduces LLM calls by ~40% while maintaining quality.
-        """
-        # Top 10: Always judge (likely positives)
-        top_candidates = dense_results[:10]
-        
-        # Middle 20: Sample 10 (hard negatives)
-        middle_pool = dense_results[10:30] if len(dense_results) > 10 else []
-        middle_sample = random.sample(middle_pool, min(10, len(middle_pool)))
-        
-        # Bottom 20: Sample 5 (easy negatives)
-        bottom_pool = dense_results[30:50] if len(dense_results) > 30 else []
-        bottom_sample = random.sample(bottom_pool, min(5, len(bottom_pool)))
-        
-        candidates = top_candidates + middle_sample + bottom_sample
-        
-        logger.debug(
-            f"Smart sampling: {len(dense_results)} → {len(candidates)} "
-            f"(top:{len(top_candidates)}, mid:{len(middle_sample)}, bot:{len(bottom_sample)})"
-        )
-        
+                "stats": self.stats,
+            }
+        tmp = str(self.checkpoint_file) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        Path(tmp).replace(self.checkpoint_file)
+
+    # -----------------------------
+    # Core steps
+    # -----------------------------
+    def _lookup_candidates_text(self, bm25_results: List[Tuple[str, float]]) -> Dict[str, str]:
+        candidates: Dict[str, str] = {}
+        if not bm25_results:
+            return candidates
+
+        if self._doc_text is not None:
+            for doc_id, _ in bm25_results:
+                t = self._doc_text.get(doc_id)
+                if t is not None:
+                    candidates[doc_id] = t
+            return candidates
+
+        # Fallback: if BM25Index has a method (optional)
+        if hasattr(self.bm25, "get_text"):
+            for doc_id, _ in bm25_results:
+                try:
+                    t = self.bm25.get_text(doc_id)
+                    if t:
+                        candidates[doc_id] = t
+                except Exception:
+                    pass
         return candidates
-    
-    def cross_encoder_rerank(
-        self, 
-        query: str, 
-        passages: List[Dict], 
-        top_k: int = 30
-    ) -> List[Dict]:
-        """
-        Rerank passages using cross-encoder.
-        Much faster than LLM, better than cosine similarity.
-        """
+
+    def _filter_passages(self, passages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         if not passages:
             return []
-        
-        # Create pairs
-        pairs = [(query, p["text"]) for p in passages]
-        
-        # Predict scores
-        ce_scores = self.cross_encoder.predict(pairs)
-        
-        # Sort by cross-encoder score
-        scored = sorted(
-            zip(passages, ce_scores),
-            key=lambda x: x[1],
-            reverse=True
-        )
-        
-        return [p for p, score in scored[:top_k]]
-    
-    def select_hard_negatives(
-        self,
-        bm25_results: List[Tuple[str, float]],
-        dense_results: List[Dict],
-        positives: List[Dict],
-        all_judged: List[Dict],
-        num_negatives: int = 10
-    ) -> List[str]:
-        """
-        Mine hard negatives from BM25 vs Dense disagreements.
-        """
-        positive_ids = {p["doc_id"] for p in positives}
-        dense_top_ids = {d["doc_id"] for d in dense_results[:20]}
-        bm25_top_ids = {doc_id for doc_id, score in bm25_results[:20]}
-        
-        # Get high-score negatives (judged as negative but scored high)
-        hard_negatives = []
-        
-        for judged in all_judged:
-            if judged["doc_id"] in positive_ids:
+
+        min_tokens = int(self.agent_cfg["min_passage_tokens"])
+        max_per_page = int(self.agent_cfg["max_passages_per_page"])
+
+        out: List[Dict[str, str]] = []
+        per_page: Dict[str, int] = {}
+
+        for p in passages:
+            text = p.get("text") or ""
+            if _count_tokens_rough(text) < min_tokens:
                 continue
-            
-            # Type 1: High BM25, low dense (lexical false positives)
-            if judged["doc_id"] in bm25_top_ids and judged["doc_id"] not in dense_top_ids:
-                hard_negatives.append(judged["doc_id"])
-            
-            # Type 2: High dense, low BM25 (semantic false positives)
-            elif judged["doc_id"] in dense_top_ids and judged["doc_id"] not in bm25_top_ids:
-                hard_negatives.append(judged["doc_id"])
-            
-            # Type 3: High cross-encoder score but negative judgment
-            elif judged.get("relevance_score", 0) == 1:  # Somewhat related but not good
-                hard_negatives.append(judged["doc_id"])
-        
-        # Return up to num_negatives
-        selected = hard_negatives[:num_negatives]
-        
-        logger.debug(f"Hard negatives: {len(selected)} mined from disagreements")
-        
-        return selected
-    
-    def process_query(self, query_rec: Dict) -> Dict[str, Any]:
-        """Process single query with all optimizations."""
-        start_time = time.time()
-        
-        qid = query_rec["query_id"]
-        qtext = query_rec["text"]
-        
-        # Step 1: BM25 retrieval (larger pool)
-        bm25_results = self.bm25.search_with_scores(
-            qtext,
-            top_k=self.cfg['agent']['global_top_k_bm25']
-        )
-        
+
+            page_id = _page_id_from_doc_id(p["doc_id"])
+            used = per_page.get(page_id, 0)
+            if used >= max_per_page:
+                continue
+
+            out.append(p)
+            per_page[page_id] = used + 1
+
+        return out
+
+    def _select_llm_candidates(self, reranked: List[str], candidates_dict: Dict[str, str]) -> List[Dict[str, str]]:
+        top_k = int(self.agent_cfg["llm_candidates_top_k"])
+        selected_ids = reranked[:top_k]
+
+        passages = [{"doc_id": did, "text": candidates_dict[did]} for did in selected_ids if did in candidates_dict]
+        return self._filter_passages(passages)
+
+    def _select_hard_negatives(
+        self,
+        judged: List[Dict[str, Any]],
+        positives: List[Dict[str, Any]],
+    ) -> List[str]:
+        num_neg = int(self.agent_cfg["hard_negatives_per_query"])
+        pos_ids = {p["doc_id"] for p in positives}
+
+        # Hard negatives = judged NOs (or low relevance) closest to decision boundary.
+        # In YES/NO mode, just take top judged that are not positives.
+        negs: List[str] = []
+        for j in judged:
+            did = j["doc_id"]
+            if did in pos_ids:
+                continue
+            negs.append(did)
+            if len(negs) >= num_neg:
+                break
+        return negs
+
+    def process_query(self, query_rec: Dict[str, Any], precomputed_bm25: Optional[List[Tuple[str, float]]] = None) -> Dict[str, Any]:
+        qid = str(query_rec["query_id"])
+        qtext = str(query_rec["text"])
+
+        start = time.time()
+
+        # BM25
+        bm25_results = precomputed_bm25
+        if bm25_results is None:
+            bm25_results = self.bm25.search_with_scores(qtext, top_k=int(self.agent_cfg["global_top_k_bm25"]))
+
         if not bm25_results:
-            logger.debug(f"No BM25 results for query {qid}")
-            return {"positives": 0, "hard_negatives": 0}
-        
-        # Step 2: Convert BM25 results to dict format for dense encoder
-        # BM25 returns List[Tuple[doc_id, score]], need Dict[doc_id, text]
-        bm25_doc_ids = [doc_id for doc_id, score in bm25_results]
-        
-        # Load passage texts from BM25 index
-        candidates_dict = {}
-        for doc_id in bm25_doc_ids:
-            # Get passage text from BM25 corpus
-            idx = self.bm25.doc_ids.index(doc_id) if doc_id in self.bm25.doc_ids else None
-            if idx is not None and idx < len(self.bm25.corpus):
-                candidates_dict[doc_id] = self.bm25.corpus[idx]
-        
-        # Step 3: Dense reranking
-        dense_top = self.dense_encoder.rerank(
+            return {"query_id": qid, "positives": 0, "hard_negatives": 0, "elapsed_s": time.time() - start}
+
+        # candidate texts (doc_id -> passage text)
+        candidates_dict = self._lookup_candidates_text(bm25_results)
+        if not candidates_dict:
+            return {"query_id": qid, "positives": 0, "hard_negatives": 0, "elapsed_s": time.time() - start}
+
+        # Dense rerank
+        dense_top_ids: List[str] = self.dense_encoder.rerank(
             qtext,
-            candidates_dict,  # Now passing dict instead of list
-            top_k=self.cfg['agent']['dense_top_k_from_bm25']
+            candidates_dict,
+            top_k=int(self.agent_cfg["dense_top_k_from_bm25"]),
         )
-        
-        # Convert back to list of dicts format
-        dense_top_passages = [
-            {"doc_id": doc_id, "text": candidates_dict[doc_id]}
-            for doc_id in dense_top
-        ]
-        
-        # Step 4: Cross-encoder filtering (fast, high quality)
-        ce_filtered = self.cross_encoder_rerank(
-            qtext,
-            dense_top_passages,
-            top_k=40
-        )
-        
-        # Step 5: Smart sampling for LLM judging
-        llm_candidates = self.smart_sample_passages(
-            bm25_results,
-            ce_filtered,
-            num_llm_candidates=25
-        )
-        
-        # Step 6: LLM judging (only ~25 passages instead of 40)
+
+        # Choose LLM candidates
+        llm_candidates = self._select_llm_candidates(dense_top_ids, candidates_dict)
+        if not llm_candidates:
+            return {"query_id": qid, "positives": 0, "hard_negatives": 0, "elapsed_s": time.time() - start}
+
+        # LLM judge (sync wrapper)
         judged = self.llm_judge.judge_batch(qtext, llm_candidates)
-        
-        self.stats["llm_calls"] += len(llm_candidates)
-        self.stats["passages_judged"] += len(judged)
-        
-        # Step 7: Extract positives (relevance_score >= 2)
+
+        with self._stats_lock:
+            self.stats["passages_judged"] += len(judged)
+
+        # Positives
+        conf_th = float(self.agent_cfg["llm_conf_threshold"])
+        positives_max = int(self.agent_cfg["positives_max"])
+
         positives = [
             j for j in judged
-            if j.get("answerable", False) and j.get("relevance_score", 0) >= 2
-        ]
-        
-        self.stats["positives_found"] += len(positives)
-        
-        # Step 8: Select hard negatives
-        hard_neg_ids = self.select_hard_negatives(
-            bm25_results,
-            dense_top_passages,
-            positives,
-            judged,
-            num_negatives=self.cfg['agent']['hard_negatives_per_query']
-        )
-        
-        self.stats["hard_negatives_found"] += len(hard_neg_ids)
-        
-        # Step 9: Write outputs
-        self._write_qrels(qid, positives)
-        self._write_triples(qid, qtext, positives, hard_neg_ids)
-        
-        # Update stats
-        elapsed = time.time() - start_time
-        self.stats["queries_processed"] += 1
-        self.stats["total_time"] += elapsed
-        self.stats["avg_time_per_query"] = (
-            self.stats["total_time"] / self.stats["queries_processed"]
-        )
-        
-        return {
-            "positives": len(positives),
-            "hard_negatives": len(hard_neg_ids),
-            "time": elapsed
-        }
-    
-    def _write_qrels(self, query_id: str, positives: List[Dict]):
-        """Write qrels with multi-grade relevance."""
-        with open(self.qrels_path, 'a') as f:
-            for p in positives:
-                # Format: query_id 0 doc_id relevance_score
-                f.write(f"{query_id}\t0\t{p['doc_id']}\t{p.get('relevance_score', 3)}\n")
-    
-    def _write_triples(
-        self, 
-        query_id: str, 
-        query_text: str, 
-        positives: List[Dict], 
-        hard_neg_ids: List[str]
-    ):
-        """Write training triples."""
+            if bool(j.get("answerable", False)) and float(j.get("confidence", 0.0)) >= conf_th
+        ][:positives_max]
+
+        hard_neg_ids = self._select_hard_negatives(judged, positives)
+
+        # Write outputs
+        self._write_outputs(qid, qtext, positives, hard_neg_ids)
+
+        elapsed = time.time() - start
+        with self._stats_lock:
+            self.stats["queries_processed"] += 1
+            self.stats["positives_found"] += len(positives)
+            self.stats["hard_negatives_found"] += len(hard_neg_ids)
+            self.stats["total_time_s"] += elapsed
+            self.stats["avg_time_per_query_s"] = self.stats["total_time_s"] / max(1, self.stats["queries_processed"])
+
+        return {"query_id": qid, "positives": len(positives), "hard_negatives": len(hard_neg_ids), "elapsed_s": elapsed}
+
+    def _write_outputs(
+        self,
+        query_id: str,
+        query_text: str,
+        positives: List[Dict[str, Any]],
+        hard_neg_ids: List[str],
+    ) -> None:
         if not positives:
             return
-        
+
         triple = {
             "query_id": query_id,
             "query": query_text,
             "positive_doc_ids": [p["doc_id"] for p in positives],
             "positive_scores": [p.get("relevance_score", 3) for p in positives],
-            "hard_negative_doc_ids": hard_neg_ids
+            "hard_negative_doc_ids": hard_neg_ids,
         }
-        
-        with open(self.triples_path, 'a') as f:
-            f.write(json.dumps(triple) + '\n')
-    
-    # In agent_runner.py, update the run() method's exception handling:
 
-    def run(self, queries):
-        """Run agent on all queries."""
-        # Filter already processed
-        remaining = [q for q in queries if q["query_id"] not in self.processed_queries]
-        
+        with self._write_lock:
+            with open(self.qrels_path, "a") as f:
+                for p in positives:
+                    f.write(f"{query_id}\t0\t{p['doc_id']}\t{p.get('relevance_score', 3)}\n")
+
+            with open(self.triples_path, "a") as f:
+                f.write(json.dumps(triple) + "\n")
+
+    # -----------------------------
+    # Runner
+    # -----------------------------
+    def run(self, queries: List[Dict[str, Any]]) -> None:
+        max_queries = self.agent_cfg.get("max_queries")
+        checkpoint_interval = int(self.agent_cfg["checkpoint_interval"])
+        batch_size = int(self.agent_cfg["batch_size"])
+        concurrent_queries = int(self.agent_cfg["concurrent_queries"])
+
+        remaining = [q for q in queries if str(q["query_id"]) not in self.processed_queries]
+        if max_queries is not None:
+            remaining = remaining[: int(max_queries)]
+
+        total = len(queries)
         logger.info(f"Processing {len(remaining):,} queries ({len(self.processed_queries):,} already done)")
-        
-        total_queries = len(queries)
-        checkpoint_interval = self.cfg['agent']['checkpoint_interval']
-        
-        for i, query_rec in enumerate(tqdm(remaining, desc="Processing queries")):
-            try:
-                stats = self.process_query(query_rec)
-                self.processed_queries.add(query_rec["query_id"])
-                
-                # Checkpoint every N queries
-                if (i + 1) % checkpoint_interval == 0:
-                    self._save_checkpoint()
-                    self._log_stats(total_queries)
-                
-            except Exception as e:
-                logger.error(f"Error processing query {query_rec['query_id']}: {e}")
-                import traceback
-                logger.error(traceback.format_exc())  # Full traceback
-                continue
-        
-        # Final save
+
+        for batch_start in range(0, len(remaining), batch_size):
+            batch = remaining[batch_start : batch_start + batch_size]
+
+            # Optional: batch BM25 if available
+            bm25_batch: Optional[List[List[Tuple[str, float]]]] = None
+            if hasattr(self.bm25, "batch_search_with_scores"):
+                try:
+                    bm25_batch = self.bm25.batch_search_with_scores(
+                        [q["text"] for q in batch],
+                        top_k=int(self.agent_cfg["global_top_k_bm25"]),
+                    )
+                except Exception as e:
+                    logger.warning(f"BM25 batch_search_with_scores failed; falling back to per-query BM25: {e}")
+                    bm25_batch = None
+
+            if concurrent_queries <= 1:
+                for i, q in enumerate(batch):
+                    qid = str(q["query_id"])
+                    res = self.process_query(q, precomputed_bm25=(bm25_batch[i] if bm25_batch else None))
+                    with self._processed_lock:
+                        self.processed_queries.add(qid)
+
+                    if self.stats["queries_processed"] % checkpoint_interval == 0:
+                        self._save_checkpoint()
+                        self._log_stats(total)
+            else:
+                with ThreadPoolExecutor(max_workers=concurrent_queries) as ex:
+                    futures = []
+                    for i, q in enumerate(batch):
+                        bm25_pre = (bm25_batch[i] if bm25_batch else None)
+                        futures.append(ex.submit(self.process_query, q, bm25_pre))
+
+                    for fut in as_completed(futures):
+                        try:
+                            res = fut.result()
+                            with self._processed_lock:
+                                self.processed_queries.add(str(res["query_id"]))
+
+                            if self.stats["queries_processed"] % checkpoint_interval == 0:
+                                self._save_checkpoint()
+                                self._log_stats(total)
+                        except Exception as e:
+                            logger.error(f"Worker error: {e}")
+                            continue
+
         self._save_checkpoint()
-        self._log_stats(total_queries)
-        
+        self._log_stats(total)
         logger.info("✓ Agent run complete!")
         logger.info(f"  Qrels: {self.qrels_path}")
         logger.info(f"  Triples: {self.triples_path}")
+
+    def _estimate_remaining(self, total_queries: int) -> str:
+        avg = float(self.stats.get("avg_time_per_query_s", 0.0) or 0.0)
+        if avg <= 0:
+            return "calculating..."
+        remaining = max(0, int(total_queries) - int(self.stats.get("queries_processed", 0)))
+        seconds = remaining * avg
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"{h}h {m}m"
+
+    def _log_stats(self, total_queries: int) -> None:
+        with self._stats_lock:
+            qp = int(self.stats["queries_processed"])
+            avg = float(self.stats["avg_time_per_query_s"])
+            llm = int(self.stats["passages_judged"])
+            pos = int(self.stats["positives_found"])
+            neg = int(self.stats["hard_negatives_found"])
+            remain = self._estimate_remaining(total_queries)
+
+        logger.info(
+            "\n"
+            "================= PROGRESS =================\n"
+            f"Queries processed: {qp:,}\n"
+            f"Passages judged:   {llm:,}\n"
+            f"Positives found:   {pos:,}\n"
+            f"Hard negatives:    {neg:,}\n"
+            f"Avg / query:       {avg:.3f}s\n"
+            f"Est. remaining:    {remain}\n"
+            "===========================================\n"
+        )

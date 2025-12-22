@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Main CLI entrypoint for Weak Labels agent."""
+"""Main CLI entrypoint for Weak Labels agent (config-driven).
+
+Everything configurable is read from configs/base.yaml via cfg.raw.
+"""
+
+from __future__ import annotations
 
 import sys
 import json
 from pathlib import Path
+from typing import Any, Dict, List
+
+from dotenv import load_dotenv
 from loguru import logger
 from datasets import load_dataset
 from tqdm import tqdm
@@ -14,168 +22,166 @@ from .bm25_index import BM25Index
 from .dense_encoder import DenseEncoder
 from .llm_client import CachedLLMJudge
 from .agent_runner import Agent
-from dotenv import load_dotenv  
 
 
-def setup_logging(log_dir: Path):
-    """Configure logging."""
+def setup_logging(logging_cfg: Dict[str, Any]) -> None:
+    """Configure loguru from config."""
+    log_dir = Path(logging_cfg["log_dir"])
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "agent.log"
-    
+
+    log_file = log_dir / logging_cfg.get("log_file", "agent.log")
+    level = logging_cfg.get("level", "INFO")
+
+    rotation = logging_cfg["rotation"]
+    retention = logging_cfg["retention"]
+
     logger.remove()
-    logger.add(sys.stderr, level="INFO")
+    logger.add(sys.stderr, level=level)
     logger.add(
         str(log_file),
-        rotation="100 MB",
-        retention="7 days",
-        level="DEBUG"
+        rotation=rotation,
+        retention=retention,
+        level="DEBUG",
+        enqueue=True,
     )
 
 
-def main():
-    """Main entry point."""
+def _as_queries_list(cfg_raw: Dict[str, Any], queries_ds) -> List[Dict[str, str]]:
+    q_cfg = cfg_raw["dataset"]["queries"]
+    id_field = q_cfg["id_field"]
+    text_field = q_cfg["text_field"]
 
+    if id_field in queries_ds.column_names and text_field in queries_ds.column_names:
+        ids = queries_ds[id_field]
+        texts = queries_ds[text_field]
+        out = []
+        for qid, qtext in zip(ids, texts):
+            if qid is None or qtext is None:
+                continue
+            out.append({"query_id": str(qid), "text": str(qtext)})
+        return out
+
+    out = []
+    for item in tqdm(queries_ds, desc="Converting queries"):
+        qid = item.get(id_field)
+        qtext = item.get(text_field)
+        if qid is None or qtext is None:
+            continue
+        out.append({"query_id": str(qid), "text": str(qtext)})
+    return out
+
+
+def main() -> None:
     load_dotenv()
-    
-    # Load config
+
     cfg = load_config()
-    
-    # Setup logging
-    log_dir = Path("logs")
-    setup_logging(log_dir)
-    
-    logger.info("="*60)
-    logger.info("Weak Labels Agent - Starting")
-    logger.info("="*60)
-    
-    # Validate paths
+    cfg_raw = cfg.raw
+
+    setup_logging(cfg_raw["logging"])
+
+    logger.info("=" * 60)
+    logger.info("Weak Labels Agent")
+    logger.info("=" * 60)
+
     if not validate_paths(cfg):
         logger.error("Path validation failed!")
         sys.exit(1)
-    
-    # Load datasets
-    logger.info("\nLoading datasets...")
-    
-    # Access config correctly - use raw dict for nested access
-    corpus = load_dataset(
-        cfg.raw['dataset']['corpus']['name'],
-        split=cfg.raw['dataset']['corpus']['split'],
-        cache_dir=cfg.raw['paths']['hf_cache_dir']
+
+    logger.info("Loading datasets...")
+
+    hf_cache_dir = cfg_raw["paths"]["hf_cache_dir"]
+
+    corpus_ds = load_dataset(
+        cfg_raw["dataset"]["corpus"]["name"],
+        split=cfg_raw["dataset"]["corpus"]["split"],
+        cache_dir=hf_cache_dir,
     )
-    
-    queries_dataset = load_dataset(
-        cfg.raw['dataset']['queries']['name'],
-        split=cfg.raw['dataset']['queries']['split'],
-        cache_dir=cfg.raw['paths']['hf_cache_dir']
+
+    queries_ds = load_dataset(
+        cfg_raw["dataset"]["queries"]["name"],
+        split=cfg_raw["dataset"]["queries"]["split"],
+        cache_dir=hf_cache_dir,
     )
-    
-    logger.info(f"✓ Corpus: {len(corpus):,} documents")
-    logger.info(f"✓ Queries: {len(queries_dataset):,} queries")
-    
-    # Convert queries dataset to list of dicts
-    logger.info("\nPreparing queries...")
-    queries = []
-    for item in tqdm(queries_dataset, desc="Converting queries"):
-        # Handle different possible field names
-        query_id = item.get('query_id') or item.get('id') or item.get('_id')
-        query_text = item.get('text') or item.get('query') or item.get('question')
-        
-        if query_id and query_text:
-            queries.append({
-                'query_id': str(query_id),
-                'text': str(query_text)
-            })
-    
-    # Limit queries if max_queries is set (for testing)
-    max_queries = cfg.raw['agent'].get('max_queries')
+
+    logger.info(f"✓ Corpus: {len(corpus_ds):,} documents")
+    logger.info(f"✓ Queries: {len(queries_ds):,} queries")
+
+    max_queries = cfg_raw["agent"].get("max_queries")
     if max_queries is not None:
-        original_count = len(queries)
-        queries = queries[:max_queries]
-        logger.warning(f"⚠ TEST MODE: Limiting to {max_queries:,} queries (out of {original_count:,})")
-    
+        max_q = int(max_queries)
+        queries_ds = queries_ds.select(range(min(max_q, len(queries_ds))))
+        logger.warning(f"TEST MODE: Limiting to {len(queries_ds):,} queries")
+
+    logger.info("Preparing queries...")
+    queries = _as_queries_list(cfg_raw, queries_ds)
     logger.info(f"✓ Prepared {len(queries):,} queries")
-    
-    # Prepare passages
-    passages_path = Path(cfg.raw['paths']['prepared_dir']) / "corpus_passages.jsonl"
-    passages_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
+    # ---------------------------
+    # Passages file (chunk once)
+    # ---------------------------
+    passages_dir = Path(cfg_raw["paths"]["passages_dir"])
+    passages_dir.mkdir(parents=True, exist_ok=True)
+    passages_path = passages_dir / "corpus_passages.jsonl"
+
     if not passages_path.exists():
-        logger.info("\nChunking corpus into passages...")
-        
+        logger.info("Chunking corpus into passages...")
         chunker = PassageChunker(
-            chunk_size=cfg.raw['corpus']['passage_tokens'],
-            stride=cfg.raw['corpus']['passage_stride']
+            chunk_size=int(cfg_raw["corpus"]["passage_tokens"]),
+            stride=int(cfg_raw["corpus"]["passage_stride"]),
         )
-        
-        passages = chunker.chunk_corpus(corpus)
-        
-        # Save passages
-        logger.info(f"Saving passages to {passages_path}...")
-        with passages_path.open('w') as f:
+
+        passages = chunker.chunk_corpus(corpus_ds)
+
+        logger.info(f"Writing passages: {passages_path}")
+        with passages_path.open("w") as f:
             for p in tqdm(passages, desc="Writing passages"):
-                f.write(json.dumps(p) + '\n')
-        
+                f.write(json.dumps(p) + "\n")
+
         logger.info(f"✓ Saved {len(passages):,} passages")
     else:
-        passage_count = sum(1 for _ in passages_path.open('r'))
+        with passages_path.open("r") as f:
+            passage_count = sum(1 for _ in f)
         logger.info(f"✓ Using existing passages: {passage_count:,}")
-    
+
+    # ---------------------------
     # Initialize components
-    logger.info("\nInitializing retrieval components...")
-    
-    # BM25
+    # ---------------------------
+    logger.info("Initializing retrieval + judge components...")
+
     bm25 = BM25Index(
         passages_path,
-        k1=cfg.raw['bm25']['k1'],
-        b=cfg.raw['bm25']['b']
+        bm25_cfg=cfg_raw["bm25"],
+        paths_cfg=cfg_raw["paths"],
     )
-    
-    # Dense encoder
-    dense_enc = DenseEncoder(
-        model_name=cfg.raw['dense']['model_name']
-    )
-    
-    # LLM judge
-    llm_judge = CachedLLMJudge(
-        base_url=cfg.raw['llm']['base_url'],
-        model=cfg.raw['llm']['model'],
-        cache_db=str(Path(cfg.raw['paths']['prepared_dir']) / "llm_cache.db"),
-        timeout=cfg.raw['llm'].get('timeout', 30.0),
-        max_concurrent=cfg.raw['llm'].get('max_concurrent', 20)
-    )
-    
-    logger.info("✓ All components initialized")
-    
-    # Initialize agent
-    logger.info("\nInitializing agent...")
+
+    dense = DenseEncoder(dense_cfg=cfg_raw["dense"])
+
+    llm_judge = CachedLLMJudge(cfg_raw["llm"])
+
     agent = Agent(
         bm25=bm25,
-        dense_encoder=dense_enc,
+        dense_encoder=dense,
         llm_judge=llm_judge,
-        config=cfg.raw
+        config=cfg_raw,
     )
-    
-    # Run agent
-    logger.info("\nStarting query processing...")
+
+    logger.info("Starting query processing...")
     agent.run(queries)
-    
-    logger.info("\n" + "="*60)
+
     logger.info("✓ Agent finished successfully")
-    logger.info("="*60)
-    
-    # Auto-push to HuggingFace (if configured)
-    if cfg.raw.get('huggingface', {}).get('auto_push', False):
-        logger.info("\nPushing outputs to HuggingFace Hub...")
-        
+
+    hf_cfg = cfg_raw.get("huggingface", {}) or {}
+    if bool(hf_cfg.get("auto_push", False)):
+        logger.info("Pushing outputs to Hugging Face Hub...")
         try:
             from .push_to_hf import push_to_hub
-            
+
             push_to_hub(
-                qrels_path=cfg.raw['output']['qrels_path'],
-                triples_path=cfg.raw['output']['triples_path'],
-                repo_id=cfg.raw['huggingface']['repo_id'],
-                token=cfg.raw['huggingface'].get('token'),
-                private=cfg.raw['huggingface'].get('private', False)
+                qrels_path=cfg_raw["output"]["qrels_path"],
+                triples_path=cfg_raw["output"]["triples_path"],
+                repo_id=hf_cfg["repo_id"],
+                token=hf_cfg.get("token"),
+                private=bool(hf_cfg.get("private", False)),
             )
         except Exception as e:
             logger.error(f"Failed to push to HuggingFace: {e}")

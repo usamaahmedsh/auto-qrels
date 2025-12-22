@@ -1,13 +1,18 @@
+# configs/base.yaml
+# Weak Labels: config-first, zero hidden knobs.
+
+# -------------------------
 # Dataset Configuration
+# -------------------------
 dataset:
-  name: "wiki"  # Active dataset: "wiki" or "msmarco"
-  
+  name: "wiki"  # e.g. "wiki" | "msmarco"
+
   corpus:
     name: "usamaahmedsh/wiki-synthetic-prepared-corpus"
     split: "train"
     text_field: "text"
     id_field: "doc_id"
-  
+
   queries:
     name: "usamaahmedsh/wiki-synthetic-prepared-queries"
     split: "train"
@@ -15,7 +20,9 @@ dataset:
     id_field: "query_id"
 
 
+# -------------------------
 # Paths Configuration
+# -------------------------
 paths:
   prepared_dir: "data/prepared"
   hf_cache_dir: "data/hf_cache"
@@ -23,78 +30,136 @@ paths:
   indexes_dir: "data/indexes"
 
 
+# -------------------------
 # Corpus Chunking
+# -------------------------
 corpus:
   passage_tokens: 160
   passage_stride: 80
 
 
-# BM25 Index
+# -------------------------
+# BM25 Index (bm25s)
+# -------------------------
 bm25:
   k1: 0.9
   b: 0.4
 
+  method: "lucene"
+  stopwords: "en"
+  use_stemmer: true
 
-# Dense Encoder
+  index_name: "bm25s"
+  mmap: true
+  load_corpus: true
+
+
+# -------------------------
+# Dense Encoder (SentenceTransformers)
+# -------------------------
 dense:
   model_name: "BAAI/bge-base-en-v1.5"
-  device: "mps"  # "cuda", "cpu", or "mps"
-  batch_size: 32
+  device: "cuda:0"
+  batch_size: 128
+  normalize_embeddings: true
+  cache_queries: true
+  max_query_cache_size: 50000
 
 
-# LLM Judge
+# -------------------------
+# LLM Judge (vLLM OpenAI-compatible)
+# -------------------------
 llm:
-  base_url: "http://127.0.0.1:8080/v1/chat/completions"
-  model: "llama-3.2-3b-instruct"
-  timeout: 30.0  # Reduced (3B is faster)
-  max_concurrent: 20  # Increased (3B handles more)
+  # vLLM OpenAI-compatible endpoint (your client normalizes /v1 vs /v1/chat/completions)
+  base_url: "http://127.0.0.1:8000/v1/chat/completions"
+  model: "meta-llama/Llama-3.2-3B-Instruct"
+
+  # Timeouts (seconds)
+  timeout_total: 60.0
+  timeout_connect: 10.0
+  timeout_read: 60.0
+  timeout_write: 10.0
+  timeout_pool: 10.0
+
+  # Retries
+  max_retries: 3
+  retry_backoff_s: 0.05
+
+  # Concurrency + payload sizing (max-throughput mode)
+  max_concurrent_requests: 32        # very aggressive concurrency [web:194][web:196]
+  passages_per_request: 16           # large batch per request
+  passage_chars: 500
+
+  # Structured output settings consumed by your client
+  guided:
+    mode: "choice"      # "choice" or "json"
+    choices: ["YES", "NO"]
+
+  httpx:
+    max_connections: 256
+    max_keepalive_connections: 128
+    keepalive_expiry_s: 30.0
+
+  cache:
+    enabled: true
+    db_path: "data/prepared/llm_cache.db"
+    sqlite:
+      journal_mode: "WAL"
+      synchronous: "NORMAL"
+      busy_timeout_ms: 30000
+      cache_size_kb: 65536
+      temp_store: "MEMORY"
 
 
-
+# -------------------------
 # Agent Configuration
+# -------------------------
 agent:
-  # BM25 retrieval
-  global_top_k_bm25: 200
-  bm25_score_percentile: 0.5
-  
-  # Dense retrieval
-  dense_top_k_from_bm25: 100
-  
-  # LLM judging
-  llm_candidates_top_k: 40
-  llm_conf_threshold: 0.75
-  positives_max: 5
-  
-  # Hard negatives
-  hard_negatives_per_query: 10
-  
-  # Filtering
-  min_passage_tokens: 50
-  max_passages_per_page: 2
-  
-  # Checkpointing
+  batch_size: 384
+  concurrent_queries: 10            # drive many queries in parallel [web:184][web:189]
   checkpoint_dir: "data/checkpoints"
   checkpoint_interval: 100
-
-  # Testing
   max_queries: null
 
+  # Retrieval fan-out (aggressively trimmed)
+  global_top_k_bm25: 128            # fewer BM25 candidates, still high recall [web:217][web:221]
+  dense_top_k_from_bm25: 64         # fewer dense candidates
 
-# Output
+  # LLM candidate pool and thresholds
+  llm_candidates_top_k: 12          # smaller pool into judge
+  llm_conf_threshold: 0.80          # slightly relaxed confidence
+  positives_max: 7
+
+  hard_negatives_per_query: 10      # fewer negatives per query
+
+  min_passage_tokens: 50
+  max_passages_per_page: 2
+
+
+# -------------------------
+# Output Files
+# -------------------------
 output:
   qrels_path: "data/output/qrels.tsv"
   triples_path: "data/output/triples.jsonl"
 
 
-# Logging
+# -------------------------
+# Logging (Loguru configured in cli.py)
+# -------------------------
 logging:
   log_dir: "logs"
   level: "INFO"
   log_file: "agent.log"
+  rotation: "100 MB"
+  retention: "7 days"
 
+
+# -------------------------
 # HuggingFace Hub (optional)
+# -------------------------
 huggingface:
-  auto_push: true  # Set to true to auto-push after agent completes
-  repo_id: "usamaahmedsh/weak-labels-wiki"  # Your HF repo
-  token: null  # Or set HF_TOKEN env var
-  private: false  # Make dataset private
+  auto_push: true
+  repo_id: "usamaahmedsh/weak-labels-wiki"
+  token: null
+  private: false

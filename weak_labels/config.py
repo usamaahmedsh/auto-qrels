@@ -1,141 +1,193 @@
-"""Configuration management for Weak Labels agent."""
+"""
+weak_labels/config.py
 
+Config loader + validation for Weak Labels.
+
+Policy:
+- No logging configuration at import time (avoids double handlers + hardcoded paths).
+- Validation enforces sections and the specific keys used by the rewritten modules.
+- YAML parsing uses yaml.safe_load(). [web:998]
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
+
 import yaml
 from loguru import logger
 
 
+@dataclass
 class Config:
-    """
-    Configuration loader with validation and defaults.
-    
-    Loads from YAML and provides convenient attribute access.
-    """
-    
-    def __init__(self, config_path: str = "configs/base.yaml"):
-        config_path = Path(config_path)
-        
-        if not config_path.exists():
-            raise FileNotFoundError(f"Config file not found: {config_path}")
-        
-        logger.info(f"Loading config from {config_path}")
-        
-        with open(config_path, 'r') as f:
-            self.raw = yaml.safe_load(f)
-        
-        # Validate structure
-        self._validate()
-        
-        # Create convenient accessors
-        self.dataset = self.raw['dataset']
-        self.paths = self.raw['paths']
-        self.corpus = self.raw['corpus']
-        self.bm25 = self.raw['bm25']
-        self.dense = self.raw['dense']
-        self.llm = self.raw['llm']
-        self.agent = self.raw['agent']
-        self.output = self.raw['output']
-        
-        logger.info(f"✓ Config loaded (dataset: {self.dataset['name']})")
-    
-    def _validate(self):
-        """Validate required config sections exist."""
-        required = [
-            'dataset',
-            'paths',
-            'corpus',
-            'bm25',
-            'dense',
-            'llm',
-            'agent',
-            'output'
-        ]
-        
-        missing = [key for key in required if key not in self.raw]
-        
-        if missing:
-            raise ValueError(
-                f"Missing required config sections: {missing}\n"
-                f"Check your configs/base.yaml file"
-            )
-        
-        # Validate dataset structure
-        if 'corpus' not in self.raw['dataset']:
-            raise ValueError("dataset.corpus section missing")
-        
-        if 'queries' not in self.raw['dataset']:
-            raise ValueError("dataset.queries section missing")
-        
-        # Validate required nested keys
-        dataset_corpus_required = ['name', 'split']
-        for key in dataset_corpus_required:
-            if key not in self.raw['dataset']['corpus']:
-                raise ValueError(f"dataset.corpus.{key} missing")
-        
-        dataset_queries_required = ['name', 'split']
-        for key in dataset_queries_required:
-            if key not in self.raw['dataset']['queries']:
-                raise ValueError(f"dataset.queries.{key} missing")
-    
-    def get(self, key: str, default: Any = None) -> Any:
-        """
-        Get config value with dot notation support.
-        
-        Examples:
-            cfg.get('llm.timeout', 120.0)
-            cfg.get('agent.checkpoint_interval', 100)
-        """
-        keys = key.split('.')
-        value = self.raw
-        
-        try:
-            for k in keys:
-                value = value[k]
-            return value
-        except (KeyError, TypeError):
-            return default
-    
-    def __getitem__(self, key: str) -> Any:
-        """Support dict-like access: cfg['dataset']"""
-        return self._data[key]
-    
-    def __repr__(self) -> str:
-        return f"Config(dataset={self.dataset['name']})"
+    raw: Dict[str, Any]
+    path: Path
+
+    # Convenience accessors (kept for your existing style)
+    dataset: Dict[str, Any]
+    paths: Dict[str, Any]
+    corpus: Dict[str, Any]
+    bm25: Dict[str, Any]
+    dense: Dict[str, Any]
+    llm: Dict[str, Any]
+    agent: Dict[str, Any]
+    output: Dict[str, Any]
+    logging: Dict[str, Any]
+    huggingface: Dict[str, Any]
 
 
-def validate_paths(config: Config) -> bool:
-    """
-    Validate and create necessary directories.
-    
-    Args:
-        config: Loaded configuration
-    
-    Returns:
-        True if validation passes
-    """
-    paths_to_create = [
-        config.paths['prepared_dir'],
-        config.paths['hf_cache_dir'],
-        config.agent['checkpoint_dir'],
-        Path(config.output['qrels_path']).parent,
-        Path(config.output['triples_path']).parent,
-    ]
-    
-    for path in paths_to_create:
-        Path(path).mkdir(parents=True, exist_ok=True)
-    
-    return True
+def _require(d: Dict[str, Any], key: str, ctx: str) -> Any:
+    if key not in d:
+        raise ValueError(f"Missing required key: {ctx}.{key}")
+    return d[key]
+
+
+def _require_str(d: Dict[str, Any], key: str, ctx: str) -> str:
+    v = _require(d, key, ctx)
+    if not isinstance(v, str) or not v.strip():
+        raise ValueError(f"Invalid {ctx}.{key}: expected non-empty string")
+    return v
+
+
+def _require_num(d: Dict[str, Any], key: str, ctx: str) -> float:
+    v = _require(d, key, ctx)
+    if not isinstance(v, (int, float)):
+        raise ValueError(f"Invalid {ctx}.{key}: expected number")
+    return float(v)
+
+
+def _require_int(d: Dict[str, Any], key: str, ctx: str) -> int:
+    v = _require(d, key, ctx)
+    if not isinstance(v, int):
+        raise ValueError(f"Invalid {ctx}.{key}: expected int")
+    return int(v)
 
 
 def load_config(config_path: str = "configs/base.yaml") -> Config:
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    with path.open("r") as f:
+        raw = yaml.safe_load(f)  # safe_load is recommended to avoid unsafe constructors. [web:998]
+
+    if not isinstance(raw, dict):
+        raise ValueError("Config root must be a mapping/dict")
+
+    _validate(raw)
+
+    return Config(
+        raw=raw,
+        path=path,
+        dataset=raw["dataset"],
+        paths=raw["paths"],
+        corpus=raw["corpus"],
+        bm25=raw["bm25"],
+        dense=raw["dense"],
+        llm=raw["llm"],
+        agent=raw["agent"],
+        output=raw["output"],
+        logging=raw["logging"],
+        huggingface=raw.get("huggingface", {}) or {},
+    )
+
+
+def _validate(raw: Dict[str, Any]) -> None:
+    # Top-level sections required by rewritten code
+    required_sections = ["dataset", "paths", "corpus", "bm25", "dense", "llm", "agent", "output", "logging"]
+    missing = [s for s in required_sections if s not in raw]
+    if missing:
+        raise ValueError(f"Missing required config sections: {missing}")
+
+    # dataset.*
+    ds = raw["dataset"]
+    _require_str(ds, "name", "dataset")
+
+    for sub in ["corpus", "queries"]:
+        sec = _require(ds, sub, "dataset")
+        if not isinstance(sec, dict):
+            raise ValueError(f"dataset.{sub} must be a dict")
+        _require_str(sec, "name", f"dataset.{sub}")
+        _require_str(sec, "split", f"dataset.{sub}")
+        # These are used by cli.py conversion
+        _require_str(sec, "text_field", f"dataset.{sub}")
+        _require_str(sec, "id_field", f"dataset.{sub}")
+
+    # paths.*
+    paths = raw["paths"]
+    for k in ["prepared_dir", "hf_cache_dir", "passages_dir", "indexes_dir"]:
+        _require_str(paths, k, "paths")
+
+    # corpus.*
+    corpus = raw["corpus"]
+    _require_int(corpus, "passage_tokens", "corpus")
+    _require_int(corpus, "passage_stride", "corpus")
+
+    # bm25.*
+    bm25 = raw["bm25"]
+    _require_num(bm25, "k1", "bm25")
+    _require_num(bm25, "b", "bm25")
+    # Optional extras are allowed (method, stopwords, use_stemmer, mmap, load_corpus, index_name)
+
+    # dense.*
+    dense = raw["dense"]
+    _require_str(dense, "model_name", "dense")
+    _require_str(dense, "device", "dense")
+    _require_int(dense, "batch_size", "dense")
+    # Optional: normalize_embeddings, cache_queries, max_query_cache_size
+
+    # llm.*
+    llm = raw["llm"]
+    _require_str(llm, "base_url", "llm")
+    _require_str(llm, "model", "llm")
+
+    # If you keep legacy llm.timeout/max_concurrent in YAML, that’s fine, but the new llm_client
+    # expects richer keys; you can add them later when you “update configs”.
+    # For now, we just accept them. (No hard failure.)
+
+    # agent.*
+    agent = raw["agent"]
+    for k in [
+        "global_top_k_bm25",
+        "dense_top_k_from_bm25",
+        "llm_candidates_top_k",
+        "llm_conf_threshold",
+        "positives_max",
+        "hard_negatives_per_query",
+        "min_passage_tokens",
+        "max_passages_per_page",
+        "checkpoint_dir",
+        "checkpoint_interval",
+    ]:
+        _require(agent, k, "agent")
+
+    # output.*
+    out = raw["output"]
+    _require_str(out, "qrels_path", "output")
+    _require_str(out, "triples_path", "output")
+
+    # logging.*
+    logging_cfg = raw["logging"]
+    _require_str(logging_cfg, "log_dir", "logging")
+    _require_str(logging_cfg, "level", "logging")
+    _require_str(logging_cfg, "log_file", "logging")
+
+
+def validate_paths(cfg: Config) -> bool:
     """
-    Load configuration from YAML file.
-    
-    Args:
-        config_path: Path to config file
-    
-    Returns:
-        Config object
+    Create required directories from config (no hardcoded paths).
     """
-    return Config(config_path)
+    to_make = [
+        Path(cfg.paths["prepared_dir"]),
+        Path(cfg.paths["hf_cache_dir"]),
+        Path(cfg.paths["passages_dir"]),
+        Path(cfg.paths["indexes_dir"]),
+        Path(cfg.agent["checkpoint_dir"]),
+        Path(cfg.logging["log_dir"]),
+        Path(cfg.output["qrels_path"]).parent,
+        Path(cfg.output["triples_path"]).parent,
+    ]
+    for p in to_make:
+        p.mkdir(parents=True, exist_ok=True)
+    return True

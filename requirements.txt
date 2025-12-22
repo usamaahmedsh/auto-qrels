@@ -1,7 +1,18 @@
+# ------------------------------------------------------------
+# PyTorch CUDA wheels (A100; cu128 index)
+# ------------------------------------------------------------
+--index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.org/simple
+
+pytrec-eval-terrier
+
 # Core ML/NLP
 datasets>=2.14.0
 sentence-transformers>=2.2.2
+
+# IMPORTANT: let pip pick a compatible torch from cu128 index
 torch>=2.0.0
+
 transformers>=4.30.0
 numpy>=1.24.0
 
@@ -18,9 +29,10 @@ pyyaml>=6.0
 tqdm>=4.66.0
 loguru>=0.7.0
 httpx>=0.24.0
-
-# Optional: Better async performance
 httpx[http2]>=0.24.0
 
 # HuggingFace Hub
 huggingface-hub>=0.20.0
+
+# vLLM (let pip pick the right prebuilt wheel for your platform if available)
+vllm
