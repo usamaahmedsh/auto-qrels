@@ -5,12 +5,12 @@ Config-driven agent runner (NO hidden knobs).
 
 Design goals:
 - All tunables come from config dict (later configs/base.yaml).
-- CPU-only agent is supported (recommended when vLLM owns the GPU).
-- Uses BM25 -> dense rerank -> LLM judge -> write qrels/triples.
+- Multi-GPU support for embeddings, cross-encoder, and LLM.
+- Uses BM25 -> dense rerank -> cross-encoder -> LLM judge -> write qrels/triples.
 - Checkpoint/resume.
 - Optional parallelism across queries (ThreadPoolExecutor), controlled by config.
 
-Expected config keys (aliases you will put in base.yaml later):
+Expected config keys:
 
 agent:
   # batching / parallelism
@@ -23,6 +23,8 @@ agent:
   # retrieval
   global_top_k_bm25: int
   dense_top_k_from_bm25: int
+  cross_encoder_top_k: int
+  use_cross_encoder: bool
 
   # LLM candidate selection / labeling
   llm_candidates_top_k: int
@@ -33,6 +35,17 @@ agent:
   # filtering
   min_passage_tokens: int
   max_passages_per_page: int
+
+  # GPU acceleration
+  device: str  # "cuda" or "cpu"
+  dense_batch_size: int
+  cross_encoder_batch_size: int
+
+cross_encoder:
+  model_name: str
+  max_length: int
+  device: str  # "cuda" or "cpu"
+  batch_size: int
 
 output:
   qrels_path: str
@@ -46,28 +59,43 @@ from pathlib import Path
 import json
 import time
 import threading
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
+import torch
 
 from .bm25_index import BM25Index
 from .dense_encoder import DenseEncoder
 from .llm_client import CachedLLMJudge
+from .cross_encoder import CrossEncoder
 
 
 DEFAULT_AGENT_CFG: Dict[str, Any] = {
-    "batch_size": 512,
-    "concurrent_queries": 4,
+    "batch_size": 1024,
+    "concurrent_queries": 8,
     "checkpoint_dir": "data/checkpoints",
-    "checkpoint_interval": 100,
+    "checkpoint_interval": 50,
     "max_queries": None,
-    "global_top_k_bm25": 200,
-    "dense_top_k_from_bm25": 100,
+    "global_top_k_bm25": 500,
+    "dense_top_k_from_bm25": 200,
+    "cross_encoder_top_k": 50,
+    "use_cross_encoder": True,
     "llm_candidates_top_k": 30,
-    "llm_conf_threshold": 0.90,
-    "positives_max": 7,
-    "hard_negatives_per_query": 20,
-    "min_passage_tokens": 50,
-    "max_passages_per_page": 2,
+    "llm_conf_threshold": 0.85,
+    "positives_max": 10,
+    "hard_negatives_per_query": 25,
+    "min_passage_tokens": 30,
+    "max_passages_per_page": 3,
+    "device": "cuda",
+    "dense_batch_size": 256,
+    "cross_encoder_batch_size": 128,
+}
+
+DEFAULT_CROSS_ENCODER_CFG: Dict[str, Any] = {
+    "model_name": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    "max_length": 512,
+    "device": "cuda",
+    "batch_size": 128,
 }
 
 
@@ -82,16 +110,21 @@ def _deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, An
 
 
 def _count_tokens_rough(s: str) -> int:
-    # Cheap approximation; real tokenizers are slower and not needed for filtering.
     return len((s or "").split())
 
 
 def _page_id_from_doc_id(doc_id: str) -> str:
-    # Matches your earlier convention "pageId_Pxx" if present.
     s = doc_id or ""
     if "_P" in s:
         return s.rsplit("_P", 1)[0]
     return s
+
+
+@dataclass
+class RetrievalResult:
+    query_id: str
+    query_text: str
+    candidates: List[Dict[str, Any]]  # [{doc_id, text, score, rank}, ...]
 
 
 class Agent:
@@ -99,15 +132,18 @@ class Agent:
         self,
         bm25: BM25Index,
         dense_encoder: DenseEncoder,
-        llm_judge: CachedLLMJudge,
+        llm_judge: Optional[CachedLLMJudge],
         config: Dict[str, Any],
+        cross_encoder: Optional[CrossEncoder] = None,
     ):
         self.bm25 = bm25
         self.dense_encoder = dense_encoder
         self.llm_judge = llm_judge
+        self.cross_encoder = cross_encoder
 
         self.cfg_raw = config
         self.agent_cfg = _deep_update(DEFAULT_AGENT_CFG, (config.get("agent") or {}))
+        self.ce_cfg = _deep_update(DEFAULT_CROSS_ENCODER_CFG, (config.get("cross_encoder") or {}))
 
         self.qrels_path = Path(config["output"]["qrels_path"])
         self.triples_path = Path(config["output"]["triples_path"])
@@ -129,14 +165,26 @@ class Agent:
             "passages_judged": 0,
             "positives_found": 0,
             "hard_negatives_found": 0,
+            "bm25_time_s": 0.0,
+            "dense_time_s": 0.0,
+            "cross_encoder_time_s": 0.0,
+            "llm_time_s": 0.0,
             "total_time_s": 0.0,
             "avg_time_per_query_s": 0.0,
         }
 
         self.processed_queries = self._load_checkpoint()
+        
+        # GPU info
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_count = torch.cuda.device_count()
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            logger.info(f"✓ GPU: {gpu_count}x {gpu_name} ({gpu_mem:.1f}GB each)")
+        
         logger.info(f"✓ Agent initialized (checkpoint: {len(self.processed_queries):,} queries)")
 
-        # Build a fast doc_id -> text mapping if BM25 exposes doc_ids/corpus.
+        # Build fast doc_id -> text mapping
         self._doc_text: Optional[Dict[str, str]] = None
         if hasattr(self.bm25, "doc_ids") and hasattr(self.bm25, "corpus"):
             try:
@@ -147,6 +195,12 @@ class Agent:
                     logger.info(f"✓ Built in-memory doc lookup: {len(self._doc_text):,} passages")
             except Exception:
                 self._doc_text = None
+
+        # Try to load precomputed dense index (for Phase 1)
+        if self.dense_encoder.load_corpus_index():
+            logger.info("✓ DenseEncoder: using precomputed corpus index for retrieval")
+        else:
+            logger.warning("DenseEncoder: no precomputed index loaded; falling back to per-query encoding")
 
     # -----------------------------
     # Checkpointing
@@ -191,7 +245,6 @@ class Agent:
                     candidates[doc_id] = t
             return candidates
 
-        # Fallback: if BM25Index has a method (optional)
         if hasattr(self.bm25, "get_text"):
             for doc_id, _ in bm25_results:
                 try:
@@ -242,8 +295,6 @@ class Agent:
         num_neg = int(self.agent_cfg["hard_negatives_per_query"])
         pos_ids = {p["doc_id"] for p in positives}
 
-        # Hard negatives = judged NOs (or low relevance) closest to decision boundary.
-        # In YES/NO mode, just take top judged that are not positives.
         negs: List[str] = []
         for j in judged:
             did = j["doc_id"]
@@ -254,42 +305,177 @@ class Agent:
                 break
         return negs
 
+    # -----------------------------
+    # Retrieval-only helpers (Phase 1) – dense index aware
+    # -----------------------------
+    def retrieve_for_query(
+        self,
+        query_rec: Dict[str, Any],
+        precomputed_bm25: Optional[List[Tuple[str, float]]] = None,
+    ) -> RetrievalResult:
+        """Phase-1 helper: BM25 -> dense index search (if available) -> optional CE."""
+        qid = str(query_rec["query_id"])
+        qtext = str(query_rec["text"])
+
+        # BM25
+        bm25_results = precomputed_bm25
+        if bm25_results is None:
+            bm25_results = self.bm25.search_with_scores(
+                qtext, top_k=int(self.agent_cfg["global_top_k_bm25"])
+            )
+        if not bm25_results:
+            return RetrievalResult(query_id=qid, query_text=qtext, candidates=[])
+
+        # BM25 candidates + texts
+        bm25_candidates = self._lookup_candidates_text(bm25_results)
+        if not bm25_candidates:
+            return RetrievalResult(query_id=qid, query_text=qtext, candidates=[])
+
+        # Dense step:
+        # If index loaded: full-corpus dense search, then intersect with BM25 IDs.
+        # Else: fallback to per-query rerank on BM25 candidates.
+        if self.dense_encoder.has_index():
+            dense_top = self.dense_encoder.search(
+                qtext,
+                top_k=int(self.agent_cfg["dense_top_k_from_bm25"]),
+            )
+            dense_ids = [did for did, _ in dense_top]
+            bm25_id_set = set(bm25_candidates.keys())
+            dense_top_ids = [did for did in dense_ids if did in bm25_id_set]
+        else:
+            dense_top_ids = self.dense_encoder.rerank(
+                qtext,
+                bm25_candidates,
+                top_k=int(self.agent_cfg["dense_top_k_from_bm25"]),
+                batch_size=int(self.agent_cfg["dense_batch_size"]),
+            )
+
+        # Cross-encoder rerank (optional)
+        if self.agent_cfg.get("use_cross_encoder") and self.cross_encoder is not None:
+            ce_candidates = {
+                did: bm25_candidates[did] for did in dense_top_ids if did in bm25_candidates
+            }
+            final_ranked = self.cross_encoder.rerank(
+                qtext,
+                ce_candidates,
+                top_k=int(self.agent_cfg["cross_encoder_top_k"]),
+            )
+        else:
+            final_ranked = dense_top_ids
+
+        # Final filtered candidates (LLM input)
+        llm_candidates = self._select_llm_candidates(final_ranked, bm25_candidates)
+
+        ranked_candidates: List[Dict[str, Any]] = []
+        for rank, p in enumerate(llm_candidates, start=1):
+            did = p["doc_id"]
+            ranked_candidates.append(
+                {
+                    "doc_id": did,
+                    "text": p["text"],
+                    "score": None,
+                    "rank": rank,
+                }
+            )
+
+        return RetrievalResult(
+            query_id=qid,
+            query_text=qtext,
+            candidates=ranked_candidates,
+        )
+
+    def build_prompt(self, result: RetrievalResult) -> str:
+        if not result.candidates:
+            return f"Question: {result.query_text}\n\nNo candidate passages found."
+
+        lines: List[str] = []
+        lines.append(
+            "You are a relevance judge. For each passage, decide if it is relevant to the query."
+        )
+        lines.append("")
+        lines.append(f"Query: {result.query_text}")
+        lines.append("")
+        lines.append("Passages:")
+
+        for c in result.candidates:
+            doc_id = c["doc_id"]
+            text = c["text"]
+            lines.append(f"- [DOC_ID={doc_id}] {text}")
+
+        lines.append("")
+        lines.append(
+            "For each passage, output a JSON array of objects, one per passage, "
+            'with fields {"doc_id": "...", "label": "YES" or "NO"}.'
+        )
+
+        return "\n".join(lines)
+
+    # -----------------------------
+    # Full pipeline for a single query (Phase 1+2, legacy)
+    # -----------------------------
     def process_query(self, query_rec: Dict[str, Any], precomputed_bm25: Optional[List[Tuple[str, float]]] = None) -> Dict[str, Any]:
         qid = str(query_rec["query_id"])
         qtext = str(query_rec["text"])
 
         start = time.time()
+        stage_times = {}
 
         # BM25
+        bm25_start = time.time()
         bm25_results = precomputed_bm25
         if bm25_results is None:
             bm25_results = self.bm25.search_with_scores(qtext, top_k=int(self.agent_cfg["global_top_k_bm25"]))
+        stage_times["bm25"] = time.time() - bm25_start
 
         if not bm25_results:
             return {"query_id": qid, "positives": 0, "hard_negatives": 0, "elapsed_s": time.time() - start}
 
-        # candidate texts (doc_id -> passage text)
+        # Candidate texts
         candidates_dict = self._lookup_candidates_text(bm25_results)
         if not candidates_dict:
             return {"query_id": qid, "positives": 0, "hard_negatives": 0, "elapsed_s": time.time() - start}
 
-        # Dense rerank
+        # Dense rerank (legacy path still uses per-query rerank)
+        dense_start = time.time()
         dense_top_ids: List[str] = self.dense_encoder.rerank(
             qtext,
             candidates_dict,
             top_k=int(self.agent_cfg["dense_top_k_from_bm25"]),
+            batch_size=int(self.agent_cfg["dense_batch_size"]),
         )
+        stage_times["dense"] = time.time() - dense_start
+
+        # Cross-encoder rerank (optional)
+        if self.agent_cfg.get("use_cross_encoder") and self.cross_encoder is not None:
+            ce_start = time.time()
+            ce_candidates = {did: candidates_dict[did] for did in dense_top_ids if did in candidates_dict}
+            cross_encoder_top_ids = self.cross_encoder.rerank(
+                qtext,
+                ce_candidates,
+                top_k=int(self.agent_cfg["cross_encoder_top_k"]),
+            )
+            stage_times["cross_encoder"] = time.time() - ce_start
+            final_ranked = cross_encoder_top_ids
+        else:
+            stage_times["cross_encoder"] = 0.0
+            final_ranked = dense_top_ids
 
         # Choose LLM candidates
-        llm_candidates = self._select_llm_candidates(dense_top_ids, candidates_dict)
-        if not llm_candidates:
+        llm_candidates = self._select_llm_candidates(final_ranked, candidates_dict)
+        if not llm_candidates or self.llm_judge is None:
             return {"query_id": qid, "positives": 0, "hard_negatives": 0, "elapsed_s": time.time() - start}
 
-        # LLM judge (sync wrapper)
+        # LLM judge
+        llm_start = time.time()
         judged = self.llm_judge.judge_batch(qtext, llm_candidates)
+        stage_times["llm"] = time.time() - llm_start
 
         with self._stats_lock:
             self.stats["passages_judged"] += len(judged)
+            self.stats["bm25_time_s"] += stage_times["bm25"]
+            self.stats["dense_time_s"] += stage_times["dense"]
+            self.stats["cross_encoder_time_s"] += stage_times["cross_encoder"]
+            self.stats["llm_time_s"] += stage_times["llm"]
 
         # Positives
         conf_th = float(self.agent_cfg["llm_conf_threshold"])
@@ -356,11 +542,12 @@ class Agent:
 
         total = len(queries)
         logger.info(f"Processing {len(remaining):,} queries ({len(self.processed_queries):,} already done)")
+        logger.info(f"Config: batch_size={batch_size}, concurrent={concurrent_queries}, device={self.agent_cfg['device']}")
 
         for batch_start in range(0, len(remaining), batch_size):
             batch = remaining[batch_start : batch_start + batch_size]
 
-            # Optional: batch BM25 if available
+            # Batch BM25 if available
             bm25_batch: Optional[List[List[Tuple[str, float]]]] = None
             if hasattr(self.bm25, "batch_search_with_scores"):
                 try:
@@ -369,7 +556,7 @@ class Agent:
                         top_k=int(self.agent_cfg["global_top_k_bm25"]),
                     )
                 except Exception as e:
-                    logger.warning(f"BM25 batch_search_with_scores failed; falling back to per-query BM25: {e}")
+                    logger.warning(f"BM25 batch_search_with_scores failed; falling back: {e}")
                     bm25_batch = None
 
             if concurrent_queries <= 1:
@@ -416,7 +603,8 @@ class Agent:
         seconds = remaining * avg
         h = int(seconds // 3600)
         m = int((seconds % 3600) // 60)
-        return f"{h}h {m}m"
+        s = int(seconds % 60)
+        return f"{h}h {m}m {s}s"
 
     def _log_stats(self, total_queries: int) -> None:
         with self._stats_lock:
@@ -426,15 +614,29 @@ class Agent:
             pos = int(self.stats["positives_found"])
             neg = int(self.stats["hard_negatives_found"])
             remain = self._estimate_remaining(total_queries)
+            
+            bm25_time = self.stats.get("bm25_time_s", 0.0)
+            dense_time = self.stats.get("dense_time_s", 0.0)
+            ce_time = self.stats.get("cross_encoder_time_s", 0.0)
+            llm_time = self.stats.get("llm_time_s", 0.0)
+            
+            avg_bm25 = bm25_time / max(1, qp)
+            avg_dense = dense_time / max(1, qp)
+            avg_ce = ce_time / max(1, qp)
+            avg_llm = llm_time / max(1, qp)
 
         logger.info(
             "\n"
             "================= PROGRESS =================\n"
-            f"Queries processed: {qp:,}\n"
+            f"Queries processed: {qp:,} / {total_queries:,}\n"
             f"Passages judged:   {llm:,}\n"
             f"Positives found:   {pos:,}\n"
             f"Hard negatives:    {neg:,}\n"
             f"Avg / query:       {avg:.3f}s\n"
+            f"  - BM25:          {avg_bm25:.3f}s\n"
+            f"  - Dense:         {avg_dense:.3f}s\n"
+            f"  - Cross-Enc:     {avg_ce:.3f}s\n"
+            f"  - LLM:           {avg_llm:.3f}s\n"
             f"Est. remaining:    {remain}\n"
             "===========================================\n"
         )

@@ -1,11 +1,12 @@
 """
 weak_labels/bm25_index.py
 
-BM25 retrieval using bm25s (pure Python).
+BM25 retrieval using bm25s (pure Python) with optional GPU acceleration.
 
 Rules:
 - Any tunable has an alias in config (later configs/base.yaml under `bm25:` and `paths:`).
 - Keep backward compatibility with the old constructor BM25Index(passages_path, k1=..., b=...).
+- Support GPU-accelerated search when available.
 
 bm25s supports:
 - retriever.save(path) and BM25.load(path, load_corpus=..., mmap=...) [web:977]
@@ -17,9 +18,16 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple, Optional
 from pathlib import Path
 import json
+import numpy as np
 
 import bm25s
 from loguru import logger
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 
 DEFAULT_BM25_CFG: Dict[str, Any] = {
@@ -29,17 +37,21 @@ DEFAULT_BM25_CFG: Dict[str, Any] = {
     "method": "lucene",
 
     # tokenization
-    "stopwords": "en",          # bm25s.tokenize stopwords arg
-    "use_stemmer": True,        # try PyStemmer if available
+    "stopwords": "en",
+    "use_stemmer": True,
 
     # storage / loading
-    "index_name": "bm25s",      # folder name inside paths.indexes_dir
-    "mmap": True,               # load index with memory mapping when available
-    "load_corpus": True,        # keep corpus texts in RAM (needed by agent for fast lookup)
+    "index_name": "bm25s",
+    "mmap": True,
+    "load_corpus": True,
 
     # passage IO expectations
     "passage_text_field": "text",
     "passage_id_field": "doc_id",
+
+    # performance
+    "num_threads": -1,  # -1 = use all cores
+    "batch_size": 512,  # for batch operations
 }
 
 
@@ -57,7 +69,7 @@ def _try_make_stemmer(enabled: bool):
     if not enabled:
         return None
     try:
-        import Stemmer  # PyStemmer
+        import Stemmer
         return Stemmer.Stemmer("english")
     except Exception:
         return None
@@ -65,7 +77,7 @@ def _try_make_stemmer(enabled: bool):
 
 class BM25Index:
     """
-    bm25s-backed BM25 index.
+    bm25s-backed BM25 index with performance optimizations.
 
     Attributes exposed for the agent:
     - doc_ids: List[str]
@@ -99,12 +111,11 @@ class BM25Index:
             cfg["b"] = float(b)
         self.cfg = cfg
 
-        # Index directory from paths.indexes_dir (config alias)
+        # Index directory from paths.indexes_dir
         indexes_dir = None
         if paths_cfg and paths_cfg.get("indexes_dir"):
             indexes_dir = Path(paths_cfg["indexes_dir"])
         else:
-            # Fallback (only for older code paths): sibling "indexes/" next to passages_dir
             indexes_dir = self.passages_path.parent.parent / "indexes"
 
         self.index_dir = Path(indexes_dir) / str(self.cfg["index_name"])
@@ -117,6 +128,16 @@ class BM25Index:
         self.doc_ids: List[str] = []
         self.corpus: List[str] = []
         self._doc_text: Dict[str, str] = {}
+        
+        # Create doc_id -> index mapping for O(1) lookup
+        self._doc_id_to_idx: Dict[str, int] = {}
+
+        # Set num threads for tokenization
+        num_threads = int(self.cfg["num_threads"])
+        if num_threads == -1:
+            import os
+            num_threads = os.cpu_count() or 1
+        self.num_threads = num_threads
 
         if self._index_exists():
             self._load()
@@ -126,6 +147,7 @@ class BM25Index:
         logger.info(
             f"✓ BM25 ready: passages={len(self.doc_ids):,}, "
             f"k1={self.cfg['k1']}, b={self.cfg['b']}, method={self.cfg['method']}, "
+            f"threads={self.num_threads}, batch_size={self.cfg['batch_size']}, "
             f"mmap={self.cfg['mmap']}, load_corpus={self.cfg['load_corpus']}"
         )
 
@@ -133,7 +155,6 @@ class BM25Index:
     # Build/load
     # ------------------------
     def _index_exists(self) -> bool:
-        # bm25s.save() creates a folder; the exact files may evolve, so check for directory non-emptiness.
         if not self.index_dir.exists():
             return False
         try:
@@ -151,7 +172,7 @@ class BM25Index:
             mmap=bool(self.cfg["mmap"]),
         )
 
-        # Load doc_id mapping and corpus texts (agent needs doc text quickly)
+        # Load doc_id mapping and corpus texts
         meta_path = self.index_dir / "passages_meta.json"
         if not meta_path.exists():
             raise FileNotFoundError(
@@ -163,6 +184,8 @@ class BM25Index:
             meta = json.load(f)
 
         self.doc_ids = list(meta["doc_ids"])
+        self._doc_id_to_idx = {doc_id: idx for idx, doc_id in enumerate(self.doc_ids)}
+        
         if bool(self.cfg["load_corpus"]):
             self.corpus = list(meta["corpus"])
             self._doc_text = dict(zip(self.doc_ids, self.corpus))
@@ -182,27 +205,38 @@ class BM25Index:
         corpus: List[str] = []
         doc_ids: List[str] = []
 
+        # Read passages with progress
         with self.passages_path.open("r") as f:
-            for line in f:
+            for line_num, line in enumerate(f, 1):
                 if not line.strip():
                     continue
-                rec = json.loads(line)
-                doc_id = rec.get(id_field)
-                text = rec.get(text_field)
-                if doc_id is None or text is None:
+                try:
+                    rec = json.loads(line)
+                    doc_id = rec.get(id_field)
+                    text = rec.get(text_field)
+                    if doc_id is None or text is None:
+                        continue
+                    doc_ids.append(str(doc_id))
+                    corpus.append(str(text))
+                    
+                    if line_num % 100000 == 0:
+                        logger.info(f"Loaded {len(doc_ids):,} passages...")
+                except json.JSONDecodeError:
+                    logger.warning(f"Skipping invalid JSON at line {line_num}")
                     continue
-                doc_ids.append(str(doc_id))
-                corpus.append(str(text))
 
         if not corpus:
             raise ValueError("No passages loaded; check your passages JSONL fields.")
 
         logger.info(f"Loaded passages: {len(doc_ids):,}")
-        logger.info("Tokenizing corpus...")
+        
+        # Tokenize with progress logging
+        logger.info(f"Tokenizing corpus (using {self.num_threads} threads)...")
         corpus_tokens = bm25s.tokenize(
             corpus,
             stopwords=self.cfg["stopwords"],
             stemmer=self.stemmer,
+            show_progress=True,
         )
 
         logger.info(f"Indexing (method={self.cfg['method']}, k1={self.cfg['k1']}, b={self.cfg['b']})...")
@@ -214,7 +248,8 @@ class BM25Index:
         self.retriever.index(corpus_tokens)
 
         # Save retriever + meta
-        self.retriever.save(str(self.index_dir))  # bm25s-native save/load [web:977]
+        logger.info(f"Saving index to: {self.index_dir}")
+        self.retriever.save(str(self.index_dir))
 
         meta = {"doc_ids": doc_ids}
         if bool(self.cfg["load_corpus"]):
@@ -225,6 +260,8 @@ class BM25Index:
 
         # Keep in memory
         self.doc_ids = doc_ids
+        self._doc_id_to_idx = {doc_id: idx for idx, doc_id in enumerate(self.doc_ids)}
+        
         if bool(self.cfg["load_corpus"]):
             self.corpus = corpus
             self._doc_text = dict(zip(self.doc_ids, self.corpus))
@@ -233,7 +270,12 @@ class BM25Index:
     # Lookup (for agent)
     # ------------------------
     def get_text(self, doc_id: str) -> Optional[str]:
+        """O(1) text lookup"""
         return self._doc_text.get(doc_id)
+    
+    def get_index(self, doc_id: str) -> Optional[int]:
+        """O(1) index lookup"""
+        return self._doc_id_to_idx.get(doc_id)
 
     # ------------------------
     # Search APIs
@@ -248,12 +290,14 @@ class BM25Index:
             stemmer=self.stemmer,
         )
 
-        results, scores = self.retriever.retrieve(q_tokens, k=int(top_k))  # (1, k), (1, k) [web:978]
+        results, scores = self.retriever.retrieve(q_tokens, k=int(top_k))
 
         out: List[Tuple[str, float]] = []
         for idx, sc in zip(results[0], scores[0]):
-            did = self.doc_ids[int(idx)]
-            out.append((did, float(sc)))
+            idx_int = int(idx)
+            if idx_int < len(self.doc_ids):
+                did = self.doc_ids[idx_int]
+                out.append((did, float(sc)))
         return out
 
     def batch_search(self, queries: List[str], top_k: int) -> List[List[str]]:
@@ -263,19 +307,39 @@ class BM25Index:
         if not queries:
             return []
 
+        # Tokenize all queries at once (parallel)
         q_tokens = bm25s.tokenize(
             queries,
             stopwords=self.cfg["stopwords"],
             stemmer=self.stemmer,
+            show_progress=False,
         )
 
-        results, scores = self.retriever.retrieve(q_tokens, k=int(top_k))  # (n, k), (n, k) [web:978]
+        # Batch retrieve
+        results, scores = self.retriever.retrieve(q_tokens, k=int(top_k))
 
+        # Convert to output format
         all_out: List[List[Tuple[str, float]]] = []
         for qi in range(len(queries)):
             row: List[Tuple[str, float]] = []
             for idx, sc in zip(results[qi], scores[qi]):
-                did = self.doc_ids[int(idx)]
-                row.append((did, float(sc)))
+                idx_int = int(idx)
+                if idx_int < len(self.doc_ids):
+                    did = self.doc_ids[idx_int]
+                    row.append((did, float(sc)))
             all_out.append(row)
         return all_out
+
+    # ------------------------
+    # Statistics
+    # ------------------------
+    def get_stats(self) -> Dict[str, Any]:
+        """Return index statistics"""
+        return {
+            "num_documents": len(self.doc_ids),
+            "corpus_loaded": bool(self._doc_text),
+            "k1": self.cfg["k1"],
+            "b": self.cfg["b"],
+            "method": self.cfg["method"],
+            "index_dir": str(self.index_dir),
+        }

@@ -6,14 +6,14 @@ Config loader + validation for Weak Labels.
 Policy:
 - No logging configuration at import time (avoids double handlers + hardcoded paths).
 - Validation enforces sections and the specific keys used by the rewritten modules.
-- YAML parsing uses yaml.safe_load(). [web:998]
+- YAML parsing uses yaml.safe_load().
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import yaml
 from loguru import logger
@@ -24,7 +24,7 @@ class Config:
     raw: Dict[str, Any]
     path: Path
 
-    # Convenience accessors (kept for your existing style)
+    # Convenience accessors
     dataset: Dict[str, Any]
     paths: Dict[str, Any]
     corpus: Dict[str, Any]
@@ -70,7 +70,7 @@ def load_config(config_path: str = "configs/base.yaml") -> Config:
         raise FileNotFoundError(f"Config file not found: {path}")
 
     with path.open("r") as f:
-        raw = yaml.safe_load(f)  # safe_load is recommended to avoid unsafe constructors. [web:998]
+        raw = yaml.safe_load(f)
 
     if not isinstance(raw, dict):
         raise ValueError("Config root must be a mapping/dict")
@@ -95,7 +95,17 @@ def load_config(config_path: str = "configs/base.yaml") -> Config:
 
 def _validate(raw: Dict[str, Any]) -> None:
     # Top-level sections required by rewritten code
-    required_sections = ["dataset", "paths", "corpus", "bm25", "dense", "llm", "agent", "output", "logging"]
+    required_sections = [
+        "dataset",
+        "paths",
+        "corpus",
+        "bm25",
+        "dense",
+        "llm",
+        "agent",
+        "output",
+        "logging",
+    ]
     missing = [s for s in required_sections if s not in raw]
     if missing:
         raise ValueError(f"Missing required config sections: {missing}")
@@ -110,7 +120,6 @@ def _validate(raw: Dict[str, Any]) -> None:
             raise ValueError(f"dataset.{sub} must be a dict")
         _require_str(sec, "name", f"dataset.{sub}")
         _require_str(sec, "split", f"dataset.{sub}")
-        # These are used by cli.py conversion
         _require_str(sec, "text_field", f"dataset.{sub}")
         _require_str(sec, "id_field", f"dataset.{sub}")
 
@@ -119,32 +128,33 @@ def _validate(raw: Dict[str, Any]) -> None:
     for k in ["prepared_dir", "hf_cache_dir", "passages_dir", "indexes_dir"]:
         _require_str(paths, k, "paths")
 
-    # corpus.*
+    # corpus.* (chunker knobs)
     corpus = raw["corpus"]
     _require_int(corpus, "passage_tokens", "corpus")
     _require_int(corpus, "passage_stride", "corpus")
+    # Optional: min_chunk_tokens, min_alpha_ratio, dedupe_hash_length,
+    # use_semantic_dedup, semantic_threshold, device
 
     # bm25.*
     bm25 = raw["bm25"]
     _require_num(bm25, "k1", "bm25")
     _require_num(bm25, "b", "bm25")
-    # Optional extras are allowed (method, stopwords, use_stemmer, mmap, load_corpus, index_name)
+    # Optional: method, stopwords, use_stemmer, mmap, load_corpus, index_name,
+    # num_threads, batch_size, passage_text_field, passage_id_field
 
     # dense.*
     dense = raw["dense"]
     _require_str(dense, "model_name", "dense")
-    _require_str(dense, "device", "dense")
+    _require(dense, "device", "dense")       # str or list[str]
     _require_int(dense, "batch_size", "dense")
-    # Optional: normalize_embeddings, cache_queries, max_query_cache_size
+    # Optional: normalize_embeddings, cache_queries, max_query_cache_size,
+    # use_fp16, show_progress
 
     # llm.*
     llm = raw["llm"]
     _require_str(llm, "base_url", "llm")
     _require_str(llm, "model", "llm")
-
-    # If you keep legacy llm.timeout/max_concurrent in YAML, that’s fine, but the new llm_client
-    # expects richer keys; you can add them later when you “update configs”.
-    # For now, we just accept them. (No hard failure.)
+    # Optional: timeouts, concurrency, httpx, cache, guided, etc.
 
     # agent.*
     agent = raw["agent"]
@@ -161,6 +171,9 @@ def _validate(raw: Dict[str, Any]) -> None:
         "checkpoint_interval",
     ]:
         _require(agent, k, "agent")
+    # Optional: batch_size, concurrent_queries, max_queries,
+    # cross_encoder_top_k, use_cross_encoder, device,
+    # dense_batch_size, cross_encoder_batch_size
 
     # output.*
     out = raw["output"]
@@ -172,6 +185,7 @@ def _validate(raw: Dict[str, Any]) -> None:
     _require_str(logging_cfg, "log_dir", "logging")
     _require_str(logging_cfg, "level", "logging")
     _require_str(logging_cfg, "log_file", "logging")
+    # Optional: rotation, retention
 
 
 def validate_paths(cfg: Config) -> bool:

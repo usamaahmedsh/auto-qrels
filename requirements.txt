@@ -1,5 +1,5 @@
 # ------------------------------------------------------------
-# PyTorch CUDA wheels (A100; cu128 index)
+# PyTorch CUDA wheels (H200; CUDA 12.8 index)
 # ------------------------------------------------------------
 --index-url https://download.pytorch.org/whl/cu128
 --extra-index-url https://pypi.org/simple
@@ -8,12 +8,12 @@ pytrec-eval-terrier
 
 # Core ML/NLP
 datasets>=2.14.0
-sentence-transformers>=2.2.2
+sentence-transformers>=2.7.0  # newer, tested with recent torch/transformers [web:137]
 
-# IMPORTANT: let pip pick a compatible torch from cu128 index
-torch>=2.0.0
+# Let pip pick a compatible torch from cu128 index (>=2.3, <=2.9 to stay in vLLM range)
+torch>=2.3.0,<2.10.0  # will resolve to a cu128 build like 2.9.0+cu128 from this index [web:61][web:134]
 
-transformers>=4.30.0
+transformers>=4.44.0  # recent enough for Llama 3.* and sentence-transformers [web:137]
 numpy>=1.24.0
 
 # BM25 Retrieval - Pure Python, no Java
@@ -21,18 +21,17 @@ bm25s[full]>=0.2.0
 PyStemmer>=2.2.0
 
 # Dense Retrieval
-faiss-cpu>=1.8.0
+# faiss-cpu not used in current agent; keep removed to save space
 
 # Utilities
 python-dotenv>=1.0.0
 pyyaml>=6.0
 tqdm>=4.66.0
 loguru>=0.7.0
-httpx>=0.24.0
 httpx[http2]>=0.24.0
 
 # HuggingFace Hub
 huggingface-hub>=0.20.0
 
-# vLLM (let pip pick the right prebuilt wheel for your platform if available)
-vllm
+# vLLM (CUDA 12.8 wheels)
+vllm>=0.7.0  # or the SCC-recommended version; 0.7+ supports cu12x + recent torch [web:131][web:136]

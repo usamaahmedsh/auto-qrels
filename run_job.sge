@@ -1,0 +1,23 @@
+#!/bin/bash -l
+#$ -P rhino-ffm
+
+# 1 H200 GPU, 8 CPU cores
+#$ -l gpus=1
+#$ -l gpu_type=H200
+#$ -pe omp 8
+
+# Walltime (max for GPU jobs on shared nodes is 48h) [web:427]
+#$ -l h_rt=30:00:00
+
+# Job name and logs
+#$ -N auto-qrels
+#$ -o logs/$JOB_NAME_$JOB_ID.out
+#$ -e logs/$JOB_NAME_$JOB_ID.err
+
+# Modules to match your run script
+module load cuda/12.8
+module load python3/3.10.12
+module load cmake/3.31.7
+
+chmod +x run_agent_hpc.sh
+./run_agent_hpc.sh
